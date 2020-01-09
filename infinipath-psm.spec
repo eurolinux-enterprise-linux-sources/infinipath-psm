@@ -2,7 +2,7 @@
 Summary: QLogic PSM Libraries
 Name: infinipath-psm
 Version: 3.0.1
-Release: 115.1015_open.1.1%{?dist}
+Release: 115.1015_open.2%{?dist}
 License: BSD or GPLv2
 ExclusiveArch: x86_64
 Group: System Environment/Libraries
@@ -50,8 +50,8 @@ rm -rf $RPM_BUILD_ROOT
 mkdir -p $RPM_BUILD_ROOT
 export DESTDIR=$RPM_BUILD_ROOT
 %{__make} install
-mkdir -p $RPM_BUILD_ROOT%{_sysconfdir}/udev.d
-cp %{SOURCE1} $RPM_BUILD_ROOT%{_sysconfdir}/udev.d/60-ipath.rules
+mkdir -p $RPM_BUILD_ROOT%{_sysconfdir}/udev/rules.d
+cp %{SOURCE1} $RPM_BUILD_ROOT%{_sysconfdir}/udev/rules.d/60-ipath.rules
 
 %clean
 rm -rf $RPM_BUILD_ROOT
@@ -63,7 +63,7 @@ rm -rf $RPM_BUILD_ROOT
 
 %files
 %defattr(-,root,root,-)
-%{_sysconfdir}/udev.d/60-ipath.rules
+%{_sysconfdir}/udev/rules.d/60-ipath.rules
 %{_libdir}/libpsm_infinipath.so.*
 %{_libdir}/libinfinipath.so.*
 
@@ -77,8 +77,10 @@ rm -rf $RPM_BUILD_ROOT
 
 %changelog
 * Thu Jan 24 2013 Jay Fenlason <fenlason@redhat.com>
+- Put the udev rules file in the right place
+  Resolves: rhbz866732
 - include a patch from upstream to fix undefined references
-  Resolves: rhbz907361
+  Resolves: rhbz887730
 
 * Tue Sep 25 2012 Jay Fenlason <fenlason@redhat.com> - 3.0.1-115.1015_open.1
 - New upstream releas
