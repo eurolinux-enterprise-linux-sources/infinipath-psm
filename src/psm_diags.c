@@ -1,4 +1,5 @@
 /*
+ * Copyright (c) 2013. Intel Corporation. All rights reserved.
  * Copyright (c) 2006-2012. QLogic Corporation. All rights reserved.
  * Copyright (c) 2003-2006, PathScale, Inc. All rights reserved.
  *
@@ -85,6 +86,9 @@ psmi_test_epid_table(int numelems)
     ep_alloc = (psm_epaddr_t) psmi_calloc(PSMI_EP_NONE, UNDEFINED, numelems, sizeof(struct psm_epaddr));
     ep_array = (psm_epaddr_t *) psmi_calloc(PSMI_EP_NONE, UNDEFINED, numelems, sizeof(struct psm_epaddr *));
     epid_array = (psm_epid_t *) psmi_calloc(PSMI_EP_NONE, UNDEFINED, numelems, sizeof(psm_epid_t));
+    diags_assert(ep_alloc != NULL);
+    diags_assert(ep_array != NULL);
+    diags_assert(epid_array != NULL);
 
     srand(12345678);
 
@@ -157,24 +161,25 @@ psmi_test_epid_table(int numelems)
 
     /* Only free on success */
     psmi_epid_fini();
+    psmi_free(epid_array);
     psmi_free(ep_array);
-    psmi_free(epaddr);
     psmi_free(ep_alloc);
     DIAGS_RETURN_PASS("");
 
 fail:
+    /* Klocwork scan report memory leak. */
+    psmi_epid_fini();
+    if (epid_array) psmi_free(epid_array);
+    if (ep_array) psmi_free(ep_array);
+    if (ep_alloc) psmi_free(ep_alloc);
     DIAGS_RETURN_FAIL("");
 }
 
 /*
  * Memcpy correctness test
  */
-static int memcpy_check_size (size_t n);
-static void *memcpy_check_one (void *dst, void *src, size_t n);
-
-static memcpy_fn_t memcpy_fn = (memcpy_fn_t) psmi_memcpyo;
-static int memcpy_passed = 0;
-static int memcpy_failed = 0;
+static int memcpy_check_size (memcpy_fn_t fn, int *p, int *f, size_t n);
+static void *memcpy_check_one (memcpy_fn_t fn, void *dst, void *src, size_t n);
 
 static int
 psmi_test_memcpy(memcpy_fn_t fn, const char *memcpy_name)
@@ -187,12 +192,13 @@ psmi_test_memcpy(memcpy_fn_t fn, const char *memcpy_name)
     long long n, m;
     char buf[128];
     int ret = 0;
+    int memcpy_passed;
+    int memcpy_failed;
 
     memcpy_passed = 0;
     memcpy_failed = 0;
-    memcpy_fn = fn;
 
-    ret = memcpy_check_size(0);
+    ret = memcpy_check_size(fn, &memcpy_passed, &memcpy_failed, 0);
     if (ret < 0)
 	DIAGS_RETURN_FAIL("no heap space");
 
@@ -200,14 +206,14 @@ psmi_test_memcpy(memcpy_fn_t fn, const char *memcpy_name)
 	_IPATH_INFO("%s %d align=0..16\n", memcpy_name, (int) n);
 	for (m = n - below; m <= n + above; m++) {
 	    if (m == n) {
-		ret = memcpy_check_size(n);
+		ret = memcpy_check_size(fn, &memcpy_passed, &memcpy_failed, n);
 		if (ret < 0)
 		    DIAGS_RETURN_FAIL("no heap space");
 	    }
 	    else if (CORNERS && m >= lo && m <= hi && m > (n >> 1) &&
 	       m < max(n, ((n << 1) - below))) 
 	    {
-		ret = memcpy_check_size((size_t) m);
+		ret = memcpy_check_size(fn, &memcpy_passed, &memcpy_failed, (size_t) m);
 		if (ret < 0)
 		    DIAGS_RETURN_FAIL("no heap space");
 	    }
@@ -231,7 +237,7 @@ psmi_test_memcpy(memcpy_fn_t fn, const char *memcpy_name)
     }
 }
 
-void *memcpy_check_one (void *dst, void *src, size_t n)
+void *memcpy_check_one (memcpy_fn_t fn, void *dst, void *src, size_t n)
 {
   int ok = 1;
   unsigned int seed = (unsigned int)
@@ -246,7 +252,7 @@ void *memcpy_check_one (void *dst, void *src, size_t n)
     ((uint8_t *) src)[i] = (rand_r(&state) >> 16) & 0xff;
   }
 
-  memcpy_fn(dst, src, n);
+  fn(dst, src, n);
   memset(src, 0, n);
   srand(seed);
   state = seed;
@@ -263,11 +269,11 @@ void *memcpy_check_one (void *dst, void *src, size_t n)
 }
 
 int
-memcpy_check_size (size_t n)
+memcpy_check_size (memcpy_fn_t fn, int *p, int *f, size_t n)
 {
-  static const int num_aligns = 16;
-  static const int USE_MALLOC = 0;
-  static const int DEBUG = 0;
+#define num_aligns 16
+#define USE_MALLOC 0
+#define DEBUG 0
   uint8_t *src;
   uint8_t *dst;
   size_t size = n * 2 + num_aligns;
@@ -275,6 +281,8 @@ memcpy_check_size (size_t n)
     src = psmi_malloc(PSMI_EP_NONE, UNDEFINED, size);
     dst = psmi_malloc(PSMI_EP_NONE, UNDEFINED, size);
     if (src == NULL || dst == NULL) 
+      if (src) psmi_free(src);
+      if (dst) psmi_free(dst);
       return -1;
   }
   else {
@@ -292,17 +300,17 @@ memcpy_check_size (size_t n)
     for (dst_align = 0; dst_align < num_aligns; dst_align++) {
       uint8_t *d = ((uint8_t *) dst) + dst_align;
       uint8_t *s = ((uint8_t *) src) + src_align;
-      int ok = (memcpy_check_one(d, s, n) != NULL);
+      int ok = (memcpy_check_one(fn, d, s, n) != NULL);
       if (DEBUG || !ok) {
         _IPATH_INFO("memcpy(%p, %p, %llu) : %s\n", d, s, 
 	       (unsigned long long) n,
                ok ? "passed" : "failed");
       }
       if (ok) {
-        memcpy_passed++;
+        (*p)++;
       }
       else {
-        memcpy_failed++;
+        (*f)++;
       }  
     }
   }

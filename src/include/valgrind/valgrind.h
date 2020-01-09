@@ -3815,7 +3815,7 @@ VALGRIND_PRINTF_BACKTRACE(const char *format, ...)
 
 /* Create a memory pool. */
 #define VALGRIND_CREATE_MEMPOOL(pool, rzB, is_zeroed)             \
-   {unsigned int _qzz_res;                                        \
+   {unsigned int _qzz_res __unused__;                             \
     VALGRIND_DO_CLIENT_REQUEST(_qzz_res, 0,                       \
                                VG_USERREQ__CREATE_MEMPOOL,        \
                                pool, rzB, is_zeroed, 0, 0);       \
@@ -3823,7 +3823,7 @@ VALGRIND_PRINTF_BACKTRACE(const char *format, ...)
 
 /* Destroy a memory pool. */
 #define VALGRIND_DESTROY_MEMPOOL(pool)                            \
-   {unsigned int _qzz_res;                                        \
+   {unsigned int _qzz_res __unused__;                             \
     VALGRIND_DO_CLIENT_REQUEST(_qzz_res, 0,                       \
                                VG_USERREQ__DESTROY_MEMPOOL,       \
                                pool, 0, 0, 0, 0);                 \
@@ -3831,7 +3831,7 @@ VALGRIND_PRINTF_BACKTRACE(const char *format, ...)
 
 /* Associate a piece of memory with a memory pool. */
 #define VALGRIND_MEMPOOL_ALLOC(pool, addr, size)                  \
-   {unsigned int _qzz_res;                                        \
+   {unsigned int _qzz_res __unused__;                             \
     VALGRIND_DO_CLIENT_REQUEST(_qzz_res, 0,                       \
                                VG_USERREQ__MEMPOOL_ALLOC,         \
                                pool, addr, size, 0, 0);           \
@@ -3839,7 +3839,7 @@ VALGRIND_PRINTF_BACKTRACE(const char *format, ...)
 
 /* Disassociate a piece of memory from a memory pool. */
 #define VALGRIND_MEMPOOL_FREE(pool, addr)                         \
-   {unsigned int _qzz_res;                                        \
+   {unsigned int _qzz_res __unused__;                             \
     VALGRIND_DO_CLIENT_REQUEST(_qzz_res, 0,                       \
                                VG_USERREQ__MEMPOOL_FREE,          \
                                pool, addr, 0, 0, 0);              \

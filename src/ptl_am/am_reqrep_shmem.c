@@ -1,4 +1,5 @@
 /*
+ * Copyright (c) 2013. Intel Corporation. All rights reserved.
  * Copyright (c) 2006-2012. QLogic Corporation. All rights reserved.
  * Copyright (c) 2003-2006, PathScale, Inc. All rights reserved.
  *
@@ -41,6 +42,7 @@
 #include "psm_am_internal.h"
 #include "kcopyrw.h"
 #include "knemrw.h"
+#include "scifrw.h"
 
 struct psm_am_max_sizes {
     uint32_t   nargs;
@@ -50,270 +52,17 @@ struct psm_am_max_sizes {
     uint32_t   reply_long;
 };
 
-/*
- * Shared memory Active Messages, implementation derived from
- * Lumetta, Mainwaring, Culler.  Multi-Protocol Active Messages on a Cluster of
- * SMP's. Supercomputing 1997.
- *
- * We support multiple endpoints in shared memory, but we only support one
- * shared memory context with up to AMSH_MAX_LOCAL_PROCS local endpoints. Some
- * structures are endpoint specific (as denoted * with amsh_ep_) and others are
- * specific to the single shared memory context * (amsh_ global variables). 
- *
- * Each endpoint maintains a shared request block and a shared reply block.
- * Each block is composed of queues for small, medium and large messages.
- */
-
-#define QFREE      0
-#define QUSED      1
-#define QREADY     2
-#define QREADYMED  3
-#define QREADYLONG 4
-
-#define QISEMPTY(flag) (flag<QREADY)
-#ifdef __powerpc__
-#  define _QMARK_FLAG_FENCE()  asm volatile("lwsync" : : : "memory")
-#elif defined(__x86_64__) || defined(__i386__)
-#  define _QMARK_FLAG_FENCE()  asm volatile("" : : : "memory")  /* compilerfence */
-#else
-#  error No _QMARK_FLAG_FENCE() defined for this platform
-#endif
-
-#define _QMARK_FLAG(pkt_ptr, _flag)      do {    \
-        _QMARK_FLAG_FENCE();                     \
-        (pkt_ptr)->flag = (_flag);               \
-        } while (0)
-
-#define QMARKFREE(pkt_ptr)  _QMARK_FLAG(pkt_ptr, QFREE)
-#define QMARKREADY(pkt_ptr) _QMARK_FLAG(pkt_ptr, QREADY)
-#define QMARKUSED(pkt_ptr)  _QMARK_FLAG(pkt_ptr, QUSED)
-
-#define AMFMT_SYSTEM       1
-#define AMFMT_SHORT_INLINE 2
-#define AMFMT_SHORT        3
-#define AMFMT_LONG         4
-#define AMFMT_LONG_END     5
-#define AMFMT_HUGE         6
-#define AMFMT_HUGE_END     7
-
-#define _shmidx _ptladdr_u32[0]
-#define _cstate _ptladdr_u32[1]
-
-#define AMSH_CMASK_NONE    0
-#define AMSH_CMASK_PREREQ  1
-#define AMSH_CMASK_POSTREQ 2
-#define AMSH_CMASK_DONE    3
-
-#define AMSH_CSTATE_TO_MASK         0x0f
-#define AMSH_CSTATE_TO_NONE         0x01
-#define AMSH_CSTATE_TO_REPLIED      0x02
-#define AMSH_CSTATE_TO_ESTABLISHED  0x03
-#define AMSH_CSTATE_TO_DISC_REPLIED 0x04
-#define AMSH_CSTATE_TO_GET(epaddr)  ((epaddr)->_cstate & AMSH_CSTATE_TO_MASK)
-#define AMSH_CSTATE_TO_SET(epaddr,state)                                      \
-            (epaddr)->_cstate = (((epaddr)->_cstate & ~AMSH_CSTATE_TO_MASK) | \
-                            ((AMSH_CSTATE_TO_ ## state) & AMSH_CSTATE_TO_MASK))
-
-#define AMSH_CSTATE_FROM_MASK         0xf0
-#define AMSH_CSTATE_FROM_NONE         0x10
-#define AMSH_CSTATE_FROM_DISC_REQ     0x40
-#define AMSH_CSTATE_FROM_ESTABLISHED  0x50
-#define AMSH_CSTATE_FROM_GET(epaddr)  ((epaddr)->_cstate & AMSH_CSTATE_FROM_MASK)
-#define AMSH_CSTATE_FROM_SET(epaddr,state)                                      \
-            (epaddr)->_cstate = (((epaddr)->_cstate & ~AMSH_CSTATE_FROM_MASK) | \
-                           ((AMSH_CSTATE_FROM_ ## state) & AMSH_CSTATE_FROM_MASK))
-
-/**********************************
- * Shared memory packet formats 
- **********************************/
-typedef 
-struct am_pkt_short {
-    uint32_t        flag;     /**> Packet state */
-    union {
-        uint32_t        bulkidx;  /**> index in bulk packet queue */
-        uint32_t        length;   /**> length when no bulkidx used */
-    };
-    uint16_t        shmidx;   /**> index in shared segment */
-    uint16_t        type;
-    uint16_t        nargs;
-    uint16_t        handleridx;
-
-    psm_amarg_t	    args[NSHORT_ARGS];	/* AM arguments */
-
-    /* We eventually will expose up to 8 arguments, but this isn't implemented
-     * For now.  >6 args will probably require a medium instead of a short */
-}
-am_pkt_short_t;
-PSMI_STRICT_SIZE_DECL(am_pkt_short_t,64);
-
-typedef struct am_pkt_bulk {
-    uint32_t    flag;
-    uint32_t    idx;
-    uintptr_t   dest;       /* Destination pointer in "longs" */
-    uint32_t    dest_off;   /* Destination pointer offset */
-    uint32_t    len;   /* Destination length within offset */
-    psm_amarg_t	args[2];    /* Additional "spillover" for >6 args */
-    uint8_t	payload[0];
-}
-am_pkt_bulk_t;
-/* No strict size decl, used for mediums and longs */
-
-/****************************************************
- * Shared memory header and block control structures
- ***************************************************/
-
-/* Each pkt queue has the same header format, although the queue
- * consumers don't use the 'head' index in the same manner. */
-typedef struct am_ctl_qhdr {
-    uint32_t    head;		/* Touched only by 1 consumer */
-    uint8_t	_pad0[64-4];
-
-    pthread_spinlock_t  lock;
-    uint32_t    tail;		/* XXX candidate for fetch-and-incr */
-    uint32_t    elem_cnt;
-    uint32_t    elem_sz;
-    uint8_t     _pad1[64-3*4-sizeof(pthread_spinlock_t)];
-}
-am_ctl_qhdr_t;
-PSMI_STRICT_SIZE_DECL(am_ctl_qhdr_t,128);
-
-/* Each block reserves some space at the beginning to store auxiliary data */
-#define AMSH_BLOCK_HEADER_SIZE  4096
-
-/* Each process has a reply qhdr and a request qhdr */
-typedef struct am_ctl_blockhdr {
-    volatile am_ctl_qhdr_t    shortq;
-    volatile am_ctl_qhdr_t    medbulkq;
-    volatile am_ctl_qhdr_t    longbulkq;
-    volatile am_ctl_qhdr_t    hugebulkq;
-}
-am_ctl_blockhdr_t;
-PSMI_STRICT_SIZE_DECL(am_ctl_blockhdr_t,128*3);
-
-/* We cache the "shorts" because that's what we poll on in the critical path.
- * We take care to always update these pointers whenever the segment is remapped.
- */ 
-typedef struct am_ctl_qshort_cache {
-    volatile am_pkt_short_t  *base;  
-    volatile am_pkt_short_t  *head;
-    volatile am_pkt_short_t  *end;
-}
-am_ctl_qshort_cache_t;
-
-/******************************************
- * Shared segment local directory (global)
- ******************************************
- *
- * Each process keeps a directory for where request and reply structures are 
- * located at its peers.  This directory must be re-initialized every time the 
- * shared segment moves in the VM, and the segment moves every time we remap()
- * for additional memory.
- */
-struct amsh_qdirectory {
-    am_ctl_blockhdr_t	*qreqH;
-    am_pkt_short_t	*qreqFifoShort;
-    am_pkt_bulk_t  	*qreqFifoMed;
-    am_pkt_bulk_t  	*qreqFifoLong;
-    am_pkt_bulk_t  	*qreqFifoHuge;
-
-    am_ctl_blockhdr_t	*qrepH;
-    am_pkt_short_t	*qrepFifoShort;
-    am_pkt_bulk_t  	*qrepFifoMed;
-    am_pkt_bulk_t  	*qrepFifoLong;
-    am_pkt_bulk_t  	*qrepFifoHuge;
-
-    int			kassist_pid;
-} __attribute__ ((aligned(8)));
-
-/* The first shared memory page is a control page to support each endpoint
- * independently adding themselves to the shared memory segment. */
-struct am_ctl_dirpage {
-    pthread_mutex_t lock;
-    char            _pad0[64-sizeof(pthread_mutex_t)];
-    volatile int    is_init;
-    char            _pad1[64-sizeof(int)];
-
-    uint16_t        psm_verno[PTL_AMSH_MAX_LOCAL_PROCS];
-    uint32_t        amsh_features[PTL_AMSH_MAX_LOCAL_PROCS];
-    int             num_attached; /* 0..MAX_LOCAL_PROCS-1 */
-    int		    max_idx;
-
-    psm_epid_t      shmidx_map_epid[PTL_AMSH_MAX_LOCAL_PROCS];
-    int		    kcopy_minor;
-    int		    kassist_pids[PTL_AMSH_MAX_LOCAL_PROCS];
-};
-
-#define AMSH_HAVE_KCOPY	0x01
-#define AMSH_HAVE_KNEM  0x02
-#define AMSH_HAVE_KASSIST 0x3
-
-/* List of context-specific shared variables */
-static struct amsh_qdirectory *amsh_qdir;
-static uintptr_t amsh_shmbase  = 0;  /* base for mmap */
-static uintptr_t amsh_blockbase = 0; /* base for block 0 (after ctl dirpage) */
-static struct am_ctl_dirpage *amsh_dirpage = NULL;
-static psm_uuid_t amsh_keyno;        /* context key uuid */
-static char	*amsh_keyname = NULL;/* context keyname */ 
-static int	 amsh_shmfd = -1;    /* context shared mmap fd */
-static int	 amsh_max_idx = -1;  /* max directory idx seen so far */
-static int       amsh_shmidx = -1;   /* last used shmidx */
-
-int psmi_kassist_fd = -1; /* when using kassist */
 int psmi_shm_mq_rv_thresh = PSMI_MQ_RV_THRESH_NO_KASSIST;
 
-static am_pkt_short_t amsh_empty_shortpkt = { 0 };
-
-/******************************************
- * Per-endpoint structures (ep-local)
- ******************************************
- * Each endpoint keeps its own information as to where it resides in the
- * directory, and maintains its own cached copies of where the short header
- * resides in shared memory.
- *
- * NOTE: All changes must be reflected in PSMI_AMSH_EP_SIZE
- */
-struct ptl {
-    psm_ep_t		   ep;
-    psm_epid_t             epid;
-    psm_epaddr_t	   epaddr;
-    ptl_ctl_t              *ctl;
-    int                    shmidx; 
-    am_ctl_qshort_cache_t  reqH;
-    am_ctl_qshort_cache_t  repH;
-    psm_epaddr_t	   shmidx_map_epaddr[PTL_AMSH_MAX_LOCAL_PROCS];
-    int                    zero_polls;
-    int                    amsh_only_polls;
-
-    pthread_mutex_t        connect_lock;
-    int                    connect_phase;
-    int                    connect_to;
-    int                    connect_from;
-};
-
-/******************************************
- * Shared fifo element counts and sizes
- ******************************************
- * These values are context-wide, they can only be set early on and can't be *
- * modified at runtime.  All endpoints are expected to use the same values.
- */
-typedef
-struct amsh_qinfo {
-    int qreqFifoShort;
-    int qreqFifoMed;
-    int qreqFifoLong;
-    int qreqFifoHuge;
-
-    int qrepFifoShort;
-    int qrepFifoMed;
-    int qrepFifoLong;
-    int qrepFifoHuge;
-}
-amsh_qinfo_t;
+#ifdef PSM_HAVE_SCIF
+#define PSM_SCIF_CONNECT_RETRIES_DEFAULT 40
+int psmi_scif_connect_retries = PSM_SCIF_CONNECT_RETRIES_DEFAULT;
+#endif
 
 /* If we push bulk packets, we place them in the target's bulk packet region,
  * if we don't push bulk packets, we place them in *our* bulk packet region and
  * have the target pull the data from our region when it needs it. */
-#define AMSH_BULK_PUSH  1   
+#define AMSH_BULK_PUSH  1
 
 /* When do we start using the "huge" buffers -- at 1MB */
 #define AMSH_HUGE_BYTES 1024*1024
@@ -322,14 +71,14 @@ amsh_qinfo_t;
 #define AMLONG_SZ   8192
 #define AMHUGE_SZ   (524288+sizeof(am_pkt_bulk_t)) /* 512k + E */
 
+/*       short med long huge */
 static const amsh_qinfo_t amsh_qcounts =
         { 1024, 256, 16, 1, 1024, 256, 16, 8 };
 
+/*        short                   med          long       huge */
 static const amsh_qinfo_t amsh_qelemsz =
         { sizeof(am_pkt_short_t), AMMED_SZ+64, AMLONG_SZ, AMHUGE_SZ, 
           sizeof(am_pkt_short_t), AMMED_SZ+64, AMLONG_SZ, AMHUGE_SZ };
-
-static amsh_qinfo_t amsh_qsizes;
 
 /* we use this internally to break up packets into MTUs */
 static const amsh_qinfo_t amsh_qpkt_max =
@@ -340,7 +89,7 @@ static const amsh_qinfo_t amsh_qpkt_max =
         };
 
 /* We expose max sizes for the AM ptl.  */
-struct psm_am_max_sizes psmi_am_max_sizes = 
+static const struct psm_am_max_sizes psmi_am_max_sizes = 
         { 6, AMMED_SZ, (uint32_t) -1,
              AMMED_SZ, (uint32_t) -1 };
 
@@ -352,20 +101,37 @@ struct psm_am_max_sizes psmi_am_max_sizes =
  *
  * _fifotyp is one of 'short' or 'bulk'
  */
-#define QGETPTR(_shmidx_, _fifo, _fifotyp, _idx)	    \
+#define QGETPTR(ptl, _shmidx_, _fifo, _fifotyp, _idx)	    \
 	(am_pkt_ ## _fifotyp ## _t *)			    \
-	(((uintptr_t)amsh_qdir[(_shmidx_)].q ## _fifo) +    \
+	(((uintptr_t)ptl->ep->amsh_qdir[(_shmidx_)].q ## _fifo) +    \
 		    (_idx) *amsh_qelemsz.q ## _fifo)
         
-static psm_error_t am_remap_segment(ptl_t *ptl, int max_idx);
+#define QGETPTR_SCIF(ptl, _shmidx_, _node_, _fifo, _fifotyp, _idx)	       \
+	(am_pkt_ ## _fifotyp ## _t *)			                       \
+	(((uintptr_t)ptl->ep->amsh_qdir[(_shmidx_)].qptrs[_node_].q ## _fifo) +\
+		    (_idx) *amsh_qelemsz.q ## _fifo)
+
+#ifdef PSM_HAVE_SCIF
+static void *am_ctl_accept_thread(void *arg);
+static psm_error_t amsh_scif_detach(psm_ep_t ep);
+#endif
 static psm_error_t amsh_poll(ptl_t *ptl, int replyonly);
+static psm_error_t amsh_poll_internal_inner(ptl_t *ptl, int replyonly, int is_internal);
 static void process_packet(ptl_t *ptl, am_pkt_short_t *pkt, int isreq);
 static void amsh_conn_handler(void *toki, psm_amarg_t *args, int narg, 
                               void *buf, size_t len);
+static void am_update_directory(ptl_t *ptl, int shmidx);
 
 /* Kassist helper functions */
 static const char * psmi_kassist_getmode(int mode);
 static int psmi_get_kassist_mode();
+
+/* SCIF DMA helper functions */
+#ifdef PSM_HAVE_SCIF
+static const char * psmi_scif_dma_getmode(int mode);
+static int psmi_get_scif_dma_mode();
+static int psmi_get_scif_dma_threshold();
+#endif
 
 /* Kcopy functionality */
 int psmi_epaddr_kcopy_pid(psm_epaddr_t epaddr);
@@ -375,9 +141,7 @@ static int psmi_kcopy_open_minor(int minor);
 static inline void
 am_ctl_qhdr_init(volatile am_ctl_qhdr_t *q, int elem_cnt, int elem_sz)
 {
-    pthread_spin_init(&q->lock, PTHREAD_PROCESS_SHARED);
     q->head = 0;
-    q->tail = 0;
     q->elem_cnt = elem_cnt;
     q->elem_sz  = elem_sz;
 }
@@ -413,18 +177,16 @@ am_ctl_sizeof_block()
 }
 #undef _PA
 
-static void am_update_directory(ptl_t *ptl, int shmidx);
-
 /**
  * Given a number of PEs, determine the amount of memory required.
  */
 static
 size_t
-psmi_amsh_segsize(int num_pe)
+psmi_amsh_segsize(int num_pe, int num_nodes)
 {
     size_t segsz;
     segsz  = PSMI_ALIGNUP(sizeof(struct am_ctl_dirpage), PSMI_PAGESIZE);
-    segsz += am_ctl_sizeof_block() * num_pe;
+    segsz += am_ctl_sizeof_block() * num_pe * num_nodes;
     return segsz;
 }
 
@@ -434,6 +196,8 @@ amsh_atexit()
 {
     static pthread_mutex_t mutex_once = PTHREAD_MUTEX_INITIALIZER;
     static int atexit_once = 0;
+    psm_ep_t ep;
+    extern psm_ep_t psmi_opened_endpoint;
 
     pthread_mutex_lock(&mutex_once); 
     if (atexit_once) {
@@ -444,14 +208,18 @@ amsh_atexit()
         atexit_once = 1;
     pthread_mutex_unlock(&mutex_once); 
 
-    if (amsh_keyname != NULL) {
-        _IPATH_VDBG("unlinking shm file %s\n", amsh_keyname);
-        shm_unlink(amsh_keyname);
-    }
+    ep = psmi_opened_endpoint;
+    while (ep) {
+	if (ep->amsh_keyname != NULL) {
+	    _IPATH_VDBG("unlinking shm file %s\n", ep->amsh_keyname);
+	    shm_unlink(ep->amsh_keyname);
+	}
 
-    if (psmi_kassist_fd != -1) {
-	close(psmi_kassist_fd);
-	psmi_kassist_fd = -1;
+	if (ep->psmi_kassist_fd != -1) {
+	    close(ep->psmi_kassist_fd);
+	    ep->psmi_kassist_fd = -1;
+	}
+	ep = ep->user_ep_next;
     }
 
     return;
@@ -474,13 +242,81 @@ amsh_mmap_fault(int sig)
       exit(1); /* XXX revisit this... there's probably a better way to exit */
 }
 
+/*
+ * Scif init to modify the epid of current process.
+ */
+#ifdef PSM_HAVE_SCIF
+static
+psm_error_t
+amsh_scif_init(psm_ep_t ep)
+{
+    scif_epd_t epd;
+    int port, nnodes;
+    uint16_t self;
+    psm_error_t err;
+    union psmi_envvar_val env_retries;
+
+    if(!psmi_getenv("PSM_SCIF_CONNECT_RETRIES",
+                "PSM SCIF connection retry count",
+                PSMI_ENVVAR_LEVEL_USER, PSMI_ENVVAR_TYPE_UINT,
+                (union psmi_envvar_val) psmi_scif_connect_retries,
+                &env_retries)) {
+        psmi_scif_connect_retries = env_retries.e_uint;
+    }
+
+    /* open end pt */
+    if ((epd = scif_open()) < 0) {
+	err = psmi_handle_error(NULL, PSM_EP_NO_RESOURCES,
+			"scif_open() failed with err %d", errno);
+	return err;
+    }
+
+    /* bind end pt to specified port */
+    if ((port = scif_bind(epd, 0)) < 0) {
+	scif_close(epd);
+	err = psmi_handle_error(NULL, PSM_EP_NO_RESOURCES,
+			"scif_bind() failed with err %d", errno);
+	return err;
+    }
+
+    /* marks an end pt as listening end pt and queues up a maximum of 32
+     * incoming connection requests */
+    if (scif_listen(epd, 40) != 0) {
+	scif_close(epd);
+	err = psmi_handle_error(NULL, PSM_EP_NO_RESOURCES,
+			"scif_listen() failed with err %d", errno);
+	return err;
+    }
+
+    if ((nnodes = scif_get_nodeIDs(NULL, 0, &self)) < 0) {
+	scif_close(epd);
+	err = psmi_handle_error(NULL, PSM_EP_NO_RESOURCES,
+			"scif_get_nodeIDs() failed with err %d", errno);
+	return err;
+    }
+
+    _IPATH_VDBG("listening on SCIF %d:%d\n", self, port);
+
+    /* Save total scif node #, modify epid to include port and self node ID.*/
+    ep->scif_epd = epd;
+    ep->scif_mynodeid = (int)self;
+    ep->scif_nnodes = nnodes;
+
+    /* Modify epid with acquired info as below */
+    ep->epid |= (((uint64_t)self)&0xFF)<<48;
+    ep->epid |= (((uint64_t)port)&0xFFFF)<<32;
+
+    return PSM_OK;
+}
+#endif
+
 /**
  * Attach endpoint shared-memory.
  *
  * We only try to obtain an shmidx at this point.
  */
 psm_error_t
-psmi_shm_attach(const psm_uuid_t uuid_key, int *shmidx_o)
+psmi_shm_attach(psm_ep_t ep, int *shmidx_o)
 {
     int ismaster = 1;
     int i;
@@ -492,15 +328,15 @@ psmi_shm_attach(const psm_uuid_t uuid_key, int *shmidx_o)
     size_t segsz;
     psm_error_t err = PSM_OK;
 
-    if (amsh_shmidx != -1) {
-        *shmidx_o = amsh_shmidx;
+    if (ep->amsh_shmidx != -1) {
+        *shmidx_o = ep->amsh_shmidx;
         return PSM_OK;
     }
 
     *shmidx_o = -1;
-    if (amsh_keyname != NULL) {
-        if (psmi_uuid_compare(amsh_keyno, uuid_key) != 0) {
-	    psmi_uuid_unparse(amsh_keyno, shmbuf);
+    if (ep->amsh_keyname != NULL) {
+        if (psmi_uuid_compare(ep->amsh_keyno, ep->key) != 0) {
+	    psmi_uuid_unparse(ep->amsh_keyno, shmbuf);
 	    err = psmi_handle_error(NULL, PSM_SHMEM_SEGMENT_ERR,
 		"Shared memory segment already initialized with key=%s",
 		shmbuf);
@@ -509,35 +345,56 @@ psmi_shm_attach(const psm_uuid_t uuid_key, int *shmidx_o)
     }
     else {
         char *p;
-        memcpy(&amsh_keyno, uuid_key, sizeof(psm_uuid_t));
+        memcpy(&ep->amsh_keyno, ep->key, sizeof(psm_uuid_t));
         strncpy(shmbuf, "/psm_shm.", sizeof shmbuf);
         p = shmbuf + strlen(shmbuf);
-        psmi_uuid_unparse(amsh_keyno, p);
-	amsh_keyname = psmi_strdup(NULL, shmbuf); 
-        if (amsh_keyname == NULL) {
+        psmi_uuid_unparse(ep->amsh_keyno, p);
+	ep->amsh_keyname = psmi_strdup(NULL, shmbuf); 
+        if (ep->amsh_keyname == NULL) {
             err = PSM_NO_MEMORY;
             goto fail;
         }
-	memset(&amsh_qdir, 0, sizeof(amsh_qdir));
     }
 
-    amsh_qdir = psmi_calloc(NULL, PER_PEER_ENDPOINT, 
+#ifdef PSM_HAVE_SCIF
+    ep->amsh_qdir = psmi_calloc(NULL, PER_PEER_ENDPOINT,
+			    PTL_AMSH_MAX_LOCAL_PROCS*ep->scif_nnodes,
+			    sizeof(struct amsh_qdirectory));
+#else
+    ep->amsh_qdir = psmi_calloc(NULL, PER_PEER_ENDPOINT, 
 			    PTL_AMSH_MAX_LOCAL_PROCS,
 			    sizeof(struct amsh_qdirectory));
-    if (amsh_qdir == NULL) {
+#endif
+
+    if (ep->amsh_qdir == NULL) {
 	err = PSM_NO_MEMORY;
 	goto fail;
     }
     
     /* Get which kassist mode to use. */
-    psmi_kassist_mode = psmi_get_kassist_mode();
-    use_kassist = (psmi_kassist_mode != PSMI_KASSIST_OFF);
-    use_kcopy = (psmi_kassist_mode & PSMI_KASSIST_KCOPY);
+    ep->psmi_kassist_mode = psmi_get_kassist_mode();
+    use_kassist = (ep->psmi_kassist_mode != PSMI_KASSIST_OFF);
+    use_kcopy = (ep->psmi_kassist_mode & PSMI_KASSIST_KCOPY);
 
-    segsz = psmi_amsh_segsize(0); /* segsize with no procs attached yet */ 
-    amsh_shmfd = shm_open(amsh_keyname, 
+#ifdef PSM_HAVE_SCIF
+    ep->scif_dma_mode = psmi_get_scif_dma_mode();
+    ep->scif_dma_threshold = psmi_get_scif_dma_threshold();
+#endif
+
+    /* Reserve enough space in the shared memory region for up to
+       PTL_AMSH_MAX_LOCAL_PROCS.  Although that much space is reserved in
+       virtual memory, physical pages are not allocated until the
+       corresponding memory location is touched.  Memory in this region is
+       only touched as processes initialize their shared queue area in
+       amsh_init_segment(), and physical memory is only allocated by the OS
+       accordingly.  So, it looks like this is consumes a lot of memory,
+       but really it consumes as much as necessary for each active process. */
+    segsz = psmi_amsh_segsize(PTL_AMSH_MAX_LOCAL_PROCS,
+                              PTL_AMSH_MAX_LOCAL_NODES);
+
+    ep->amsh_shmfd = shm_open(ep->amsh_keyname, 
                           O_RDWR | O_CREAT | O_EXCL | O_TRUNC, S_IRWXU);
-    if (amsh_shmfd < 0) {
+    if (ep->amsh_shmfd < 0) {
 	ismaster = 0;
         if (errno != EEXIST) {
             err = psmi_handle_error(NULL, PSM_SHMEM_SEGMENT_ERR, 
@@ -549,22 +406,23 @@ psmi_shm_attach(const psm_uuid_t uuid_key, int *shmidx_o)
         }
 
         /* Try to open again, knowing we won't be the shared memory master */
-        amsh_shmfd = shm_open(amsh_keyname, O_RDWR, S_IRWXU);
-        if (amsh_shmfd < 0) {
+        ep->amsh_shmfd = shm_open(ep->amsh_keyname, O_RDWR, S_IRWXU);
+        if (ep->amsh_shmfd < 0) {
             err = psmi_handle_error(NULL, PSM_SHMEM_SEGMENT_ERR, 
                 "Error attaching to shared memory object in shm_open: %s", 
                 strerror(errno));
             goto fail;
         }
     }
+
     /* Now register the atexit handler for cleanup, whether master or slave */
     atexit(amsh_atexit);
 
     _IPATH_PRDBG("Registered as %s to key %s\n", ismaster ? "master" : "slave",
-           amsh_keyname);
+           ep->amsh_keyname);
 
     if (ismaster) {
-	if (ftruncate(amsh_shmfd, segsz) != 0) {
+	if (ftruncate(ep->amsh_shmfd, segsz) != 0) {
             err = psmi_handle_error(NULL, PSM_SHMEM_SEGMENT_ERR,
                 "Error setting size of shared memory object to %u bytes in "
 		"ftruncate: %s\n", (uint32_t) segsz, strerror(errno));
@@ -578,7 +436,7 @@ psmi_shm_attach(const psm_uuid_t uuid_key, int *shmidx_o)
         struct stat fdstat;
         off_t cursize = 0;
         while (cursize == 0) {
-            if (fstat(amsh_shmfd, &fdstat)) {
+            if (fstat(ep->amsh_shmfd, &fdstat)) {
                 err = psmi_handle_error(NULL, PSM_SHMEM_SEGMENT_ERR,
                          "Error querying size of shared memory object: %s",
                         strerror(errno));
@@ -590,20 +448,22 @@ psmi_shm_attach(const psm_uuid_t uuid_key, int *shmidx_o)
         }
     }
     
-    /* We only map the first portion of the shared memory area.  This portion
-     * is a single page used for control information.  The "master" creates it
-     * and initializes it but every process must lock appropriate data
-     * structures before it reads or writes it.
+    /* We map the entire shared memory area, consisting of a control structure
+     * followed by per-process shared queue structures.  The "master" creates
+     * the control structure and initializes it but every process must lock
+     * appropriate data structures before it reads or writes it.
      */
-    mapptr = mmap(NULL, segsz, PROT_READ|PROT_WRITE, MAP_SHARED, amsh_shmfd, 0);
+    mapptr = mmap(NULL, segsz, PROT_READ|PROT_WRITE, MAP_SHARED,
+                  ep->amsh_shmfd, 0);
     if (mapptr == MAP_FAILED) {
-	err = psmi_handle_error(NULL, PSM_SHMEM_SEGMENT_ERR,
-	        "Error mmapping shared memory: %s", strerror(errno));
-	goto fail;
+        err = psmi_handle_error(NULL, PSM_SHMEM_SEGMENT_ERR,
+                "Error mmapping shared memory: %s", strerror(errno));
+        goto fail;
     }
 
-    amsh_shmbase = (uintptr_t) mapptr;
-    amsh_dirpage = (struct am_ctl_dirpage *) amsh_shmbase;
+    ep->amsh_shmbase = (uintptr_t) mapptr;
+    ep->amsh_dirpage = (struct am_ctl_dirpage *) ep->amsh_shmbase;
+    ep->amsh_blockbase = ep->amsh_shmbase + psmi_amsh_segsize(0, 0);
 
     /* We core dump right after here if we don't check the mmap */
     void (*old_handler_segv)(int) = signal (SIGSEGV, amsh_mmap_fault);
@@ -614,46 +474,74 @@ psmi_shm_attach(const psm_uuid_t uuid_key, int *shmidx_o)
         pthread_mutexattr_t attr;
 	pthread_mutexattr_init(&attr);
 	pthread_mutexattr_setpshared(&attr, PTHREAD_PROCESS_SHARED);
-	pthread_mutex_init(&(amsh_dirpage->lock), &attr);
+	pthread_mutex_init(&(ep->amsh_dirpage->lock), &attr);
 	pthread_mutexattr_destroy(&attr);
-	amsh_dirpage->num_attached = 0;
-	amsh_dirpage->max_idx = -1;
+
+	ep->amsh_dirpage->num_attached = 0;
+	ep->amsh_dirpage->max_idx = -1;
+
 	for (i = 0; i < PTL_AMSH_MAX_LOCAL_PROCS; i++) {
-	    amsh_dirpage->shmidx_map_epid[i] = 0;
-	    amsh_dirpage->kassist_pids[i] = 0;
+	    ep->amsh_dirpage->shmidx_map_epid[i] = 0;
+	    ep->amsh_dirpage->kassist_pids[i] = 0;
 	}
+
+        for(i = 0; i < PTL_AMSH_MAX_LOCAL_PROCS*PTL_AMSH_MAX_LOCAL_NODES; i++) {
+            struct amsh_qtail* qtail = &ep->amsh_dirpage->qtails[i];
+
+            qtail->reqFifoShort.tail = 0;
+            qtail->reqFifoMed.tail = 0;
+            qtail->reqFifoLong.tail = 0;
+            qtail->reqFifoHuge.tail = 0;
+
+            qtail->repFifoShort.tail = 0;
+            qtail->repFifoMed.tail = 0;
+            qtail->repFifoLong.tail = 0;
+            qtail->repFifoHuge.tail = 0;
+
+            pthread_spin_init(&qtail->reqFifoShort.lock, PTHREAD_PROCESS_SHARED);
+            pthread_spin_init(&qtail->reqFifoMed.lock, PTHREAD_PROCESS_SHARED);
+            pthread_spin_init(&qtail->reqFifoLong.lock, PTHREAD_PROCESS_SHARED);
+            pthread_spin_init(&qtail->reqFifoHuge.lock, PTHREAD_PROCESS_SHARED);
+
+            pthread_spin_init(&qtail->repFifoShort.lock, PTHREAD_PROCESS_SHARED);
+            pthread_spin_init(&qtail->repFifoMed.lock, PTHREAD_PROCESS_SHARED);
+            pthread_spin_init(&qtail->repFifoLong.lock, PTHREAD_PROCESS_SHARED);
+            pthread_spin_init(&qtail->repFifoHuge.lock, PTHREAD_PROCESS_SHARED);
+        }
+
 	if (use_kassist) {
 	  if (use_kcopy) {
-	    psmi_kassist_fd = psmi_kcopy_find_minor(&kcopy_minor);
-	    if (psmi_kassist_fd >= 0) 
-	      amsh_dirpage->kcopy_minor = kcopy_minor;
+	    ep->psmi_kassist_fd = psmi_kcopy_find_minor(&kcopy_minor);
+	    if (ep->psmi_kassist_fd >= 0) 
+	      ep->amsh_dirpage->kcopy_minor = kcopy_minor;
 	    else
-	      amsh_dirpage->kcopy_minor = -1;
+	      ep->amsh_dirpage->kcopy_minor = -1;
 	  }
 	  else {  /* Setup knem */
-	    psmi_assert_always(psmi_kassist_mode & PSMI_KASSIST_KNEM);
-	    
-	    psmi_kassist_fd = knem_open_device();
-	  }
+	    psmi_assert_always(ep->psmi_kassist_mode & PSMI_KASSIST_KNEM);
+	    ep->psmi_kassist_fd = knem_open_device();
+          }
 	  
 	}
 	else
-	  psmi_kassist_fd = -1;
+	  ep->psmi_kassist_fd = -1;
+
 	ips_mb();
-	amsh_dirpage->is_init = 1;
+
+	ep->amsh_dirpage->is_init = 1;
 	_IPATH_PRDBG("Mapped and initalized shm object control page at %p,"
-                    "size=%d, kcopy minor is %d (mode=%s)\n", mapptr, 
-		    (int) segsz, kcopy_minor, 
-		    psmi_kassist_getmode(psmi_kassist_mode));
+                    "size=%ld, kcopy minor is %d (mode=%s)\n", mapptr,
+		    segsz, kcopy_minor,
+		    psmi_kassist_getmode(ep->psmi_kassist_mode));
     }
     else {
-	volatile int *is_init = &amsh_dirpage->is_init;
+	volatile int *is_init = &ep->amsh_dirpage->is_init;
 	while (*is_init == 0) 
 	    usleep(1);
 	_IPATH_PRDBG("Slave synchronized object control page at "
 		     "%p, size=%d, kcopy minor is %d (mode=%s)\n", 
 		     mapptr, (int) segsz, kcopy_minor,
-		    psmi_kassist_getmode(psmi_kassist_mode));
+		    psmi_kassist_getmode(ep->psmi_kassist_mode));
     }
 
     /* 
@@ -663,64 +551,69 @@ psmi_shm_attach(const psm_uuid_t uuid_key, int *shmidx_o)
      * update our epid in the init phase once we actually know what our epid
      * is.
      */
-    pthread_mutex_lock((pthread_mutex_t *) &(amsh_dirpage->lock));
+    pthread_mutex_lock((pthread_mutex_t *) &(ep->amsh_dirpage->lock));
     shmidx = -1;
     for (i = 0; i < PTL_AMSH_MAX_LOCAL_PROCS; i++) {
-	if (amsh_dirpage->shmidx_map_epid[i] == 0) {
-	    amsh_dirpage->shmidx_map_epid[i] = 1;
-            amsh_dirpage->psm_verno[i] = PSMI_VERNO;
-	    amsh_dirpage->kassist_pids[i] = (int) getpid();
+	if (ep->amsh_dirpage->shmidx_map_epid[i] == 0) {
+	    ep->amsh_dirpage->shmidx_map_epid[i] = 1;
+            ep->amsh_dirpage->psm_verno[i] = PSMI_VERNO;
+	    ep->amsh_dirpage->kassist_pids[i] = (int) getpid();
+
 	    if (use_kassist) {
 	      if (!use_kcopy) {
 		if (!ismaster)
-		  psmi_kassist_fd = knem_open_device();
+		  ep->psmi_kassist_fd = knem_open_device();
 		
 		/* If we are able to use KNEM assume everyone else on the
 		 * node can also use it. Advertise that KNEM is active via
 		 * the feature flag.
 		 */
-		if (psmi_kassist_fd >= 0) {
-		  amsh_dirpage->amsh_features[i] |= AMSH_HAVE_KNEM;
+		if (ep->psmi_kassist_fd >= 0) {
+		  ep->amsh_dirpage->amsh_features[i] |= AMSH_HAVE_KNEM;
 		  psmi_shm_mq_rv_thresh = PSMI_MQ_RV_THRESH_KNEM;
 		}
 		else {
-		  psmi_kassist_mode = PSMI_KASSIST_OFF;
+		  ep->psmi_kassist_mode = PSMI_KASSIST_OFF;
 		  use_kassist = 0;
 		  psmi_shm_mq_rv_thresh = PSMI_MQ_RV_THRESH_NO_KASSIST;
 		}
 	      }
-	      else {
+	      else if(use_kcopy) {
 		psmi_assert_always(use_kcopy);
-		kcopy_minor = amsh_dirpage->kcopy_minor;
+		kcopy_minor = ep->amsh_dirpage->kcopy_minor;
 		if (!ismaster && kcopy_minor >= 0) 
-		  psmi_kassist_fd = psmi_kcopy_open_minor(kcopy_minor);
+		  ep->psmi_kassist_fd = psmi_kcopy_open_minor(kcopy_minor);
 		
 		/* If we are able to use KCOPY assume everyone else on the
 		 * node can also use it. Advertise that KCOPY is active via
 		 * the feature flag.
 		 */
-		if (psmi_kassist_fd >= 0) {
-		  amsh_dirpage->amsh_features[i] |= AMSH_HAVE_KCOPY;
+		if (ep->psmi_kassist_fd >= 0) {
+		  ep->amsh_dirpage->amsh_features[i] |= AMSH_HAVE_KCOPY;
 		  psmi_shm_mq_rv_thresh = PSMI_MQ_RV_THRESH_KCOPY;
 		}
 		else {
-		  psmi_kassist_mode = PSMI_KASSIST_OFF;
+		  ep->psmi_kassist_mode = PSMI_KASSIST_OFF;
 		  use_kassist = 0; use_kcopy = 0;
 		  psmi_shm_mq_rv_thresh = PSMI_MQ_RV_THRESH_NO_KASSIST;
 		}
-	      }
+              }
 	    }
 	    else
 	      psmi_shm_mq_rv_thresh = PSMI_MQ_RV_THRESH_NO_KASSIST;
-	    _IPATH_PRDBG("KASSIST MODE: %s\n", psmi_kassist_getmode(psmi_kassist_mode));
-	    
-            amsh_shmidx = shmidx = *shmidx_o = i;
+	    _IPATH_PRDBG("KASSIST MODE: %s\n", psmi_kassist_getmode(ep->psmi_kassist_mode));
+#ifdef PSM_HAVE_SCIF
+	    _IPATH_PRDBG("SCIF DMA MODE: %s\n", psmi_scif_dma_getmode(ep->scif_dma_mode));
+	    _IPATH_PRDBG("SCIF DMA THRESHOLD: %d\n", ep->scif_dma_threshold);
+#endif
+
+            ep->amsh_shmidx = shmidx = *shmidx_o = i;
             _IPATH_PRDBG("Grabbed shmidx %d\n", shmidx);
-            amsh_dirpage->num_attached++;
+            ep->amsh_dirpage->num_attached++;
 	    break;
 	}
     }
-    pthread_mutex_unlock((pthread_mutex_t *) &(amsh_dirpage->lock));
+    pthread_mutex_unlock((pthread_mutex_t *) &(ep->amsh_dirpage->lock));
 
     /* install the old sighandler back */
     signal(SIGSEGV, old_handler_segv);
@@ -730,6 +623,7 @@ psmi_shm_attach(const psm_uuid_t uuid_key, int *shmidx_o)
 	err = psmi_handle_error(NULL, PSM_SHMEM_SEGMENT_ERR,
 	        "Exceeded maximum of %d support local endpoints: %s", 
 		PTL_AMSH_MAX_LOCAL_PROCS, strerror(errno));
+
 fail:
     return err;
 }
@@ -754,190 +648,214 @@ static
 psm_error_t
 amsh_init_segment(ptl_t *ptl)
 {
+    struct amsh_qptrs* qptrs;
     int shmidx;
+    int i;
     psm_error_t err = PSM_OK;
+    int scif_nnodes;
 
     /* Preconditions */
     psmi_assert_always(ptl != NULL);
     psmi_assert_always(ptl->ep != NULL);
     psmi_assert_always(ptl->epaddr != NULL);
     psmi_assert_always(ptl->ep->epid != 0);
+    psmi_assert_always(ptl->ep->amsh_shmidx != -1);
 
-    /* If we haven't attached to the segment yet, do it now */
-    if (amsh_shmidx == -1) {
-        if ((err = psmi_shm_attach(ptl->ep->key, &shmidx)))
-            goto fail;
-    }
-    else
-        shmidx = amsh_shmidx;
+    shmidx = ptl->ep->amsh_shmidx;
 
-    amsh_qsizes.qreqFifoShort = AMSH_QSIZE(reqFifoShort);
-    amsh_qsizes.qreqFifoMed   = AMSH_QSIZE(reqFifoMed);
-    amsh_qsizes.qreqFifoLong  = AMSH_QSIZE(reqFifoLong);
-    amsh_qsizes.qreqFifoHuge  = AMSH_QSIZE(reqFifoHuge);
-    amsh_qsizes.qrepFifoShort = AMSH_QSIZE(repFifoShort);
-    amsh_qsizes.qrepFifoMed   = AMSH_QSIZE(repFifoMed);
-    amsh_qsizes.qrepFifoLong  = AMSH_QSIZE(repFifoLong);
-    amsh_qsizes.qrepFifoHuge  = AMSH_QSIZE(repFifoHuge);
+    ptl->amsh_qsizes.qreqFifoShort = AMSH_QSIZE(reqFifoShort);
+    ptl->amsh_qsizes.qreqFifoMed   = AMSH_QSIZE(reqFifoMed);
+    ptl->amsh_qsizes.qreqFifoLong  = AMSH_QSIZE(reqFifoLong);
+    ptl->amsh_qsizes.qreqFifoHuge  = AMSH_QSIZE(reqFifoHuge);
+    ptl->amsh_qsizes.qrepFifoShort = AMSH_QSIZE(repFifoShort);
+    ptl->amsh_qsizes.qrepFifoMed   = AMSH_QSIZE(repFifoMed);
+    ptl->amsh_qsizes.qrepFifoLong  = AMSH_QSIZE(repFifoLong);
+    ptl->amsh_qsizes.qrepFifoHuge  = AMSH_QSIZE(repFifoHuge);
 
     /* We core dump right after here if we don't check the mmap */
     void (*old_handler_segv)(int) = signal (SIGSEGV, amsh_mmap_fault);
     void (*old_handler_bus)(int)  = signal (SIGBUS, amsh_mmap_fault);
 
-    pthread_mutex_lock((pthread_mutex_t *) &(amsh_dirpage->lock));
+    pthread_mutex_lock((pthread_mutex_t *) &(ptl->ep->amsh_dirpage->lock));
 
     /*
      * Now that we know our epid, update it in the shmidx array
      */
-    amsh_dirpage->shmidx_map_epid[shmidx] = ptl->ep->epid;
+    ptl->ep->amsh_dirpage->shmidx_map_epid[shmidx] = ptl->ep->epid;
 
-    if (shmidx > amsh_dirpage->max_idx) {
-	/* Have to truncate for more space */
-	amsh_dirpage->max_idx = shmidx;
-	size_t newsize = psmi_amsh_segsize(shmidx+1);
-	if (ftruncate(amsh_shmfd, newsize) != 0) {
-	    err = psmi_handle_error(NULL, PSM_SHMEM_SEGMENT_ERR,
-		    "Error growing shared memory segment: %s",
-		    strerror(errno));
-	    goto fail_with_lock;
-	}
-	_IPATH_PRDBG("Grew shared segment for %d procs, size=%.2f MB\n",
-		     shmidx+1, newsize / 1048576.0);
+    if (shmidx > ptl->ep->amsh_dirpage->max_idx) {
+	ptl->ep->amsh_dirpage->max_idx = shmidx;
     }
 
     ptl->shmidx = shmidx;
-    ptl->shmidx_map_epaddr[shmidx] = ptl->ep->epaddr;
-    ptl->reqH.base = ptl->reqH.head = ptl->reqH.end = NULL;
-    ptl->repH.base = ptl->repH.head = ptl->repH.end = NULL;
-    if ((err = am_remap_segment(ptl, shmidx)) != PSM_OK) 
-	goto fail_with_lock;
+    ptl->ep->amsh_qdir[shmidx].amsh_epaddr = ptl->ep->epaddr;
+    for(i = 0; i < PTL_AMSH_MAX_LOCAL_NODES; i++) {
+        ptl->reqH[i].base = ptl->reqH[i].head = ptl->reqH[i].end = NULL;
+        ptl->repH[i].base = ptl->repH[i].head = ptl->repH[i].end = NULL;
+    }
 
-    memset((void *)(amsh_blockbase + am_ctl_sizeof_block() * shmidx),
-	   0, am_ctl_sizeof_block()); /* touch all of my pages */
+    /* Update all of the local directory entries once here. */
+    for(i = 0; i < PTL_AMSH_MAX_LOCAL_PROCS; i++) {
+	ptl->ep->amsh_qdir[i].amsh_base =
+		(void *)(ptl->ep->amsh_blockbase +
+                        am_ctl_sizeof_block() * PTL_AMSH_MAX_LOCAL_NODES * i);
 
-    am_update_directory(ptl, shmidx);
-    am_ctl_qhdr_init(&amsh_qdir[shmidx].qreqH->shortq, 
-                     amsh_qcounts.qreqFifoShort, amsh_qelemsz.qreqFifoShort);
-    am_ctl_qhdr_init(&amsh_qdir[shmidx].qreqH->medbulkq, 
-                     amsh_qcounts.qreqFifoMed, amsh_qelemsz.qreqFifoMed);
-    am_ctl_qhdr_init(&amsh_qdir[shmidx].qreqH->longbulkq, 
-                     amsh_qcounts.qreqFifoLong, amsh_qelemsz.qreqFifoLong);
-    am_ctl_qhdr_init(&amsh_qdir[shmidx].qreqH->hugebulkq, 
-                     amsh_qcounts.qreqFifoHuge, amsh_qelemsz.qreqFifoHuge);
-    am_ctl_qhdr_init(&amsh_qdir[shmidx].qrepH->shortq, 
-                     amsh_qcounts.qrepFifoShort, amsh_qelemsz.qrepFifoShort);
-    am_ctl_qhdr_init(&amsh_qdir[shmidx].qrepH->medbulkq, 
-                     amsh_qcounts.qrepFifoMed, amsh_qelemsz.qrepFifoMed);
-    am_ctl_qhdr_init(&amsh_qdir[shmidx].qrepH->longbulkq, 
-                     amsh_qcounts.qrepFifoLong, amsh_qelemsz.qrepFifoLong);
-    am_ctl_qhdr_init(&amsh_qdir[shmidx].qrepH->hugebulkq, 
-                     amsh_qcounts.qrepFifoHuge, amsh_qelemsz.qrepFifoHuge);
+	ptl->ep->amsh_qdir[i].amsh_shmidx = ptl->shmidx;
 
-    /* Set bulkidx in every bulk packet */
-    am_ctl_bulkpkt_init(amsh_qdir[shmidx].qreqFifoMed, amsh_qelemsz.qreqFifoMed,
-                        amsh_qcounts.qreqFifoMed);
-    am_ctl_bulkpkt_init(amsh_qdir[shmidx].qreqFifoLong, amsh_qelemsz.qreqFifoLong,
-                        amsh_qcounts.qreqFifoLong);
-    am_ctl_bulkpkt_init(amsh_qdir[shmidx].qreqFifoHuge, amsh_qelemsz.qreqFifoHuge,
-                        amsh_qcounts.qreqFifoHuge);
-    am_ctl_bulkpkt_init(amsh_qdir[shmidx].qrepFifoMed, amsh_qelemsz.qrepFifoMed,
-                        amsh_qcounts.qrepFifoMed);
-    am_ctl_bulkpkt_init(amsh_qdir[shmidx].qrepFifoLong, amsh_qelemsz.qrepFifoLong,
-                        amsh_qcounts.qrepFifoLong);
-    am_ctl_bulkpkt_init(amsh_qdir[shmidx].qrepFifoHuge, amsh_qelemsz.qrepFifoHuge,
-                        amsh_qcounts.qrepFifoHuge);
+        /* Encode our SCIF nodeid here.  The full epid for local peers isn't
+           known yet, but we do know their nodeid, which is the same as ours.
+           Marking the nodeid here enables process_packet() to work correctly
+           when packets arrive before this epid value has been set with the
+           proper epid, without extra branches in the communication path. */
+#ifdef PSM_HAVE_SCIF
+        ptl->ep->amsh_qdir[i].amsh_epid =
+            ((psm_epid_t)ptl->ep->scif_mynodeid & 0xff) << 48;
+#endif
+
+        /* Clear the SCIF socket to -1.  This indicates that the socket is not
+           going to be used, ever -- which is true since this is a local peer.
+           This prevents later code from trying to connect to self. */
+        //ptl->ep->amsh_qdir[i].amsh_epd[0] = -1;
+
+        am_update_directory(ptl, i);
+    }
+
+#ifdef PSM_HAVE_SCIF
+    scif_nnodes = ptl->ep->scif_nnodes;
+#else
+    /* No SCIF: assume one node. */
+    scif_nnodes = 1;
+#endif
+
+    /* touch all of my pages */
+    memset(ptl->ep->amsh_qdir[shmidx].amsh_base,
+	   0, am_ctl_sizeof_block() * scif_nnodes);
+
+    for(i = 0; i < scif_nnodes; i++) {
+        qptrs = &ptl->ep->amsh_qdir[shmidx].qptrs[i];
+
+        am_ctl_qhdr_init(&qptrs->qreqH->shortq,
+                amsh_qcounts.qreqFifoShort, amsh_qelemsz.qreqFifoShort);
+        am_ctl_qhdr_init(&qptrs->qreqH->medbulkq,
+                amsh_qcounts.qreqFifoMed, amsh_qelemsz.qreqFifoMed);
+        am_ctl_qhdr_init(&qptrs->qreqH->longbulkq,
+                amsh_qcounts.qreqFifoLong, amsh_qelemsz.qreqFifoLong);
+        am_ctl_qhdr_init(&qptrs->qreqH->hugebulkq,
+                amsh_qcounts.qreqFifoHuge, amsh_qelemsz.qreqFifoHuge);
+
+        am_ctl_qhdr_init(&qptrs->qrepH->shortq,
+                amsh_qcounts.qrepFifoShort, amsh_qelemsz.qrepFifoShort);
+        am_ctl_qhdr_init(&qptrs->qrepH->medbulkq,
+                amsh_qcounts.qrepFifoMed, amsh_qelemsz.qrepFifoMed);
+        am_ctl_qhdr_init(&qptrs->qrepH->longbulkq,
+                amsh_qcounts.qrepFifoLong, amsh_qelemsz.qrepFifoLong);
+        am_ctl_qhdr_init(&qptrs->qrepH->hugebulkq,
+                amsh_qcounts.qrepFifoHuge, amsh_qelemsz.qrepFifoHuge);
+
+        /* Set bulkidx in every bulk packet */
+        am_ctl_bulkpkt_init(qptrs->qreqFifoMed,
+                amsh_qelemsz.qreqFifoMed,
+                amsh_qcounts.qreqFifoMed);
+        am_ctl_bulkpkt_init(qptrs->qreqFifoLong,
+                amsh_qelemsz.qreqFifoLong,
+                amsh_qcounts.qreqFifoLong);
+        am_ctl_bulkpkt_init(qptrs->qreqFifoHuge,
+                amsh_qelemsz.qreqFifoHuge,
+                amsh_qcounts.qreqFifoHuge);
+
+        am_ctl_bulkpkt_init(qptrs->qrepFifoMed,
+                amsh_qelemsz.qrepFifoMed,
+                amsh_qcounts.qrepFifoMed);
+        am_ctl_bulkpkt_init(qptrs->qrepFifoLong,
+                amsh_qelemsz.qrepFifoLong,
+                amsh_qcounts.qrepFifoLong);
+        am_ctl_bulkpkt_init(qptrs->qrepFifoHuge,
+                amsh_qelemsz.qrepFifoHuge,
+                amsh_qcounts.qrepFifoHuge);
+    }
 
     /* install the old sighandler back */
     signal(SIGSEGV, old_handler_segv);
     signal(SIGBUS, old_handler_bus);
 
-fail_with_lock:
-    pthread_mutex_unlock((pthread_mutex_t *) &(amsh_dirpage->lock));
-
-fail:
+    pthread_mutex_unlock((pthread_mutex_t *) &(ptl->ep->amsh_dirpage->lock));
     return err;
 }
 
 psm_error_t
-psmi_shm_detach()
+psmi_shm_detach(psm_ep_t ep)
 {
     psm_error_t err = PSM_OK;
-    int do_unlock = 1;
 
-    if (amsh_shmidx == -1 || amsh_keyname == NULL)
+    if (ep->amsh_shmidx == -1 || ep->amsh_keyname == NULL)
         return err;
 
-    _IPATH_VDBG("unlinking shm file %s\n", amsh_keyname+1);
-    shm_unlink(amsh_keyname);
-    psmi_free(amsh_keyname);
-    amsh_keyname = NULL;
+#ifdef PSM_HAVE_SCIF
+    if (amsh_scif_detach(ep)) {
+        err = psmi_handle_error(NULL, PSM_SHMEM_SEGMENT_ERR,
+                "Error with amsh_scif_detach() of shared segment: %s",
+                strerror(errno));
+        goto fail;
+    }
+#endif
 
-    if (psmi_kassist_fd != -1) {
-	close(psmi_kassist_fd);
-	psmi_kassist_fd = -1;
+    _IPATH_VDBG("unlinking shm file %s\n", ep->amsh_keyname+1);
+    shm_unlink(ep->amsh_keyname);
+    psmi_free(ep->amsh_keyname);
+    ep->amsh_keyname = NULL;
+
+    if (ep->psmi_kassist_fd != -1) {
+	close(ep->psmi_kassist_fd);
+	ep->psmi_kassist_fd = -1;
     }
 
     /* go mark my shmidx as free */
-    pthread_mutex_lock((pthread_mutex_t *) &(amsh_dirpage->lock));
+    pthread_mutex_lock((pthread_mutex_t *) &(ep->amsh_dirpage->lock));
 
-    amsh_dirpage->num_attached--;
-    amsh_dirpage->shmidx_map_epid[amsh_shmidx] = 0;
-    amsh_shmidx = -1;
+    ep->amsh_dirpage->num_attached--;
+    ep->amsh_dirpage->shmidx_map_epid[ep->amsh_shmidx] = 0;
+    ep->amsh_shmidx = -1;
 
-    if (amsh_dirpage->num_attached == 0) { /* truncate to nothing */
-        do_unlock = 0;
-        if (ftruncate(amsh_shmfd, 0) != 0) {
-	    err = psmi_handle_error(NULL, PSM_SHMEM_SEGMENT_ERR,
-                "Error shrinking shared memory segment to 0: %s",
-	        strerror(errno));
-            goto fail_with_lock;
+    if (ep->amsh_dirpage->num_attached == 0) { /* truncate to nothing */
+	pthread_mutex_unlock((pthread_mutex_t *) &(ep->amsh_dirpage->lock));
+
+        /* Instead of dynamically shrinking the shared memory region, we always
+           leave it allocated for up to PTL_AMSH_MAX_LOCAL_PROCS processes.
+           Thus mremap() is never necessary, nor is ftruncate() here.
+           However when the attached process count does go to 0, we should
+           fully munmap() the entire region.
+         */
+        if (munmap((void *) ep->amsh_shmbase,
+                    psmi_amsh_segsize(PTL_AMSH_MAX_LOCAL_PROCS,
+                                      PTL_AMSH_MAX_LOCAL_NODES))) {
+            err = psmi_handle_error(NULL, PSM_SHMEM_SEGMENT_ERR,
+                    "Error with munamp of shared segment: %s", strerror(errno));
+            goto fail;
         }
-	_IPATH_PRDBG("Shrinking shared segment to 0\n");
     }
     else {
-        int i, new_max_idx = amsh_dirpage->max_idx;
-        for (i = amsh_dirpage->max_idx; i >= 0; i--) {
-            if (amsh_dirpage->shmidx_map_epid[i] == 0) 
+        int i, new_max_idx = ep->amsh_dirpage->max_idx;
+        for (i = ep->amsh_dirpage->max_idx; i >= 0; i--) {
+            if (ep->amsh_dirpage->shmidx_map_epid[i] == 0) 
                 new_max_idx = i;
             else
                 break;
         }
-        if (new_max_idx != amsh_dirpage->max_idx) { /* we can truncate */
-            size_t newsize = psmi_amsh_segsize(new_max_idx+1);
-	    _IPATH_PRDBG("Shrinking shared segment down to %d procs, "
-                "size=%.2f MB\n", new_max_idx+1, newsize / 1048576.0);
-            if (ftruncate(amsh_shmfd, newsize) != 0) {
-	        err = psmi_handle_error(NULL, PSM_SHMEM_SEGMENT_ERR,
-                    "Error shrinking shared memory segment: %s", 
-                    strerror(errno));
-                goto fail_with_lock;
-            }
-            amsh_dirpage->max_idx = new_max_idx;
-        }
+
+        ep->amsh_dirpage->max_idx = new_max_idx;
+
+        pthread_mutex_unlock((pthread_mutex_t *) &(ep->amsh_dirpage->lock));
     }
 
-    /* If we truncated down to zero, don't unlock since the storage is gone */
-    if (do_unlock)
-        pthread_mutex_unlock((pthread_mutex_t *) &(amsh_dirpage->lock));
+    ep->amsh_max_idx = -1;
+    ep->amsh_shmfd = -1;
 
-    if (munmap((void *) amsh_shmbase, psmi_amsh_segsize(amsh_max_idx+1))) {
-        err = psmi_handle_error(NULL, PSM_SHMEM_SEGMENT_ERR,
-                "Error with munamp of shared segment: %s", 
-                strerror(errno));
-        goto fail;
-    }
-    amsh_max_idx = -1;
-    amsh_shmfd = -1;
-
-    amsh_shmbase = amsh_blockbase = 0;
-    amsh_dirpage = NULL;
-    memset(amsh_keyno, 0, sizeof(amsh_keyno));
+    ep->amsh_shmbase = ep->amsh_blockbase = 0;
+    ep->amsh_dirpage = NULL;
+    memset(ep->amsh_keyno, 0, sizeof(ep->amsh_keyno));
 
     return PSM_OK;
 
-fail_with_lock:
-    if (do_unlock)
-        pthread_mutex_unlock((pthread_mutex_t *) &(amsh_dirpage->lock));
 fail:
     return err;
 }
@@ -949,145 +867,144 @@ fail:
  */
 static
 void
-am_hdrcache_update_short(int shmidx,
+am_hdrcache_update_short(ptl_t *ptl, int shmidx,
                    am_ctl_qshort_cache_t *reqH,
                    am_ctl_qshort_cache_t *repH)
 {
-    int head_shmidx;
-    head_shmidx= reqH->head - reqH->base;
-    reqH->base = QGETPTR(shmidx, reqFifoShort, short, 0);
-    reqH->head = QGETPTR(shmidx, reqFifoShort, short, head_shmidx);
-    reqH->end  = QGETPTR(shmidx, reqFifoShort, short, amsh_qcounts.qreqFifoShort);
-    head_shmidx= repH->head - repH->base;
-    repH->base = QGETPTR(shmidx, repFifoShort, short, 0);
-    repH->head = QGETPTR(shmidx, repFifoShort, short, head_shmidx);
-    repH->end  = QGETPTR(shmidx, repFifoShort, short, amsh_qcounts.qrepFifoShort);
-    return;
+    int node;
+
+    for(node = 0; node < PTL_AMSH_MAX_LOCAL_NODES; node++) {
+        reqH[node].base = QGETPTR_SCIF(ptl, shmidx, node,
+                reqFifoShort, short, 0);
+        reqH[node].head = QGETPTR_SCIF(ptl, shmidx, node,
+                reqFifoShort, short, 0);
+        reqH[node].end  = QGETPTR_SCIF(ptl, shmidx, node,
+                reqFifoShort, short, amsh_qcounts.qreqFifoShort);
+
+        repH[node].base = QGETPTR_SCIF(ptl, shmidx, node,
+                repFifoShort, short, 0);
+        repH[node].head = QGETPTR_SCIF(ptl, shmidx, node,
+                repFifoShort, short, 0);
+        repH[node].end  = QGETPTR_SCIF(ptl, shmidx, node,
+                repFifoShort, short, amsh_qcounts.qrepFifoShort);
+    }
 }
 
 /**
- * Update locally cached shared-pointer directory.  The directory must be
- * updated when a new epaddr is connected to or on every epaddr already 
- * connected to whenever the shared memory segment is relocated via mremap.
+ * Update locally cached shared-pointer directory.
  *
- * @param epaddr Endpoint address for which to update local directory.
+ * @param shmidx Endpoint index for which to update local directory.
  */
-	
+
 static
 void
 am_update_directory(ptl_t *ptl, int shmidx)
 {
+    psm_ep_t ep = ptl->ep;
     uintptr_t base_this;
+    uintptr_t base_node;
+    struct amsh_qptrs* qptrs;
+    int i;
 
     psmi_assert_always(shmidx != -1);
-    base_this = amsh_blockbase + am_ctl_sizeof_block() * shmidx + 
-                AMSH_BLOCK_HEADER_SIZE;
+    base_this =
+        (uintptr_t)ep->amsh_qdir[shmidx].amsh_base + AMSH_BLOCK_HEADER_SIZE;
 
-    if (amsh_dirpage->amsh_features[shmidx] & AMSH_HAVE_KASSIST) 
-	amsh_qdir[shmidx].kassist_pid = amsh_dirpage->kassist_pids[shmidx];
-    else
-	amsh_qdir[shmidx].kassist_pid = 0;
+    if (shmidx < PTL_AMSH_MAX_LOCAL_PROCS) {
+        if(ep->amsh_dirpage->amsh_features[shmidx] & AMSH_HAVE_KASSIST) {
+            ep->amsh_qdir[shmidx].kassist_pid =
+                ep->amsh_dirpage->kassist_pids[shmidx];
+        }
+    } else {
+        ep->amsh_qdir[shmidx].kassist_pid = 0;
+    }
 
-    /* Request queues */
-    amsh_qdir[shmidx].qreqH = (am_ctl_blockhdr_t *) base_this;
-    amsh_qdir[shmidx].qreqFifoShort = (am_pkt_short_t *)
-	((uintptr_t) amsh_qdir[shmidx].qreqH + 
-            PSMI_ALIGNUP(sizeof(am_ctl_blockhdr_t), PSMI_PAGESIZE));
+    for(i = 0; i < PTL_AMSH_MAX_LOCAL_NODES; i++) {
+        qptrs = &ep->amsh_qdir[shmidx].qptrs[i];
 
-    amsh_qdir[shmidx].qreqFifoMed = (am_pkt_bulk_t *)
-	((uintptr_t) amsh_qdir[shmidx].qreqFifoShort + amsh_qsizes.qreqFifoShort);
-    amsh_qdir[shmidx].qreqFifoLong = (am_pkt_bulk_t *)
-	((uintptr_t) amsh_qdir[shmidx].qreqFifoMed + amsh_qsizes.qreqFifoMed);
-    amsh_qdir[shmidx].qreqFifoHuge = (am_pkt_bulk_t *)
-	((uintptr_t) amsh_qdir[shmidx].qreqFifoLong + amsh_qsizes.qreqFifoLong);
+        base_node = base_this + (i * am_ctl_sizeof_block());
 
-    /* Reply queues */
-    amsh_qdir[shmidx].qrepH = (am_ctl_blockhdr_t *)
-	((uintptr_t) amsh_qdir[shmidx].qreqFifoHuge + amsh_qsizes.qreqFifoHuge);
+        /* Request queues */
+        qptrs->qreqH = (am_ctl_blockhdr_t *) base_node;
 
-    amsh_qdir[shmidx].qrepFifoShort = (am_pkt_short_t *)
-	((uintptr_t) amsh_qdir[shmidx].qrepH + 
-            PSMI_ALIGNUP(sizeof(am_ctl_blockhdr_t), PSMI_PAGESIZE));
-    amsh_qdir[shmidx].qrepFifoMed = (am_pkt_bulk_t *)
-	((uintptr_t) amsh_qdir[shmidx].qrepFifoShort + amsh_qsizes.qrepFifoShort);
-    amsh_qdir[shmidx].qrepFifoLong = (am_pkt_bulk_t *)
-	((uintptr_t) amsh_qdir[shmidx].qrepFifoMed + amsh_qsizes.qrepFifoMed);
-    amsh_qdir[shmidx].qrepFifoHuge = (am_pkt_bulk_t *)
-	((uintptr_t) amsh_qdir[shmidx].qrepFifoLong + amsh_qsizes.qrepFifoLong);
-    
-    _IPATH_VDBG("shmidx=%d Request Hdr=%p,Pkt=%p,Med=%p,Long=%p,Huge=%p\n", 
-                shmidx,
-		amsh_qdir[shmidx].qreqH, amsh_qdir[shmidx].qreqFifoShort,
-		amsh_qdir[shmidx].qreqFifoMed, amsh_qdir[shmidx].qreqFifoLong,
-                amsh_qdir[shmidx].qreqFifoHuge);
-    _IPATH_VDBG("shmidx=%d Reply   Hdr=%p,Pkt=%p,Med=%p,Long=%p,Huge=%p\n", 
-                shmidx,
-		amsh_qdir[shmidx].qrepH, amsh_qdir[shmidx].qrepFifoShort,
-		amsh_qdir[shmidx].qrepFifoMed, amsh_qdir[shmidx].qrepFifoLong,
-                amsh_qdir[shmidx].qrepFifoHuge);
+        qptrs->qreqFifoShort = (am_pkt_short_t *)
+            ((uintptr_t) qptrs->qreqH +
+             PSMI_ALIGNUP(sizeof(am_ctl_blockhdr_t), PSMI_PAGESIZE));
+        qptrs->qreqFifoMed = (am_pkt_bulk_t *)
+            ((uintptr_t) qptrs->qreqFifoShort +
+             ptl->amsh_qsizes.qreqFifoShort);
+        qptrs->qreqFifoLong = (am_pkt_bulk_t *)
+            ((uintptr_t) qptrs->qreqFifoMed +
+             ptl->amsh_qsizes.qreqFifoMed);
+        qptrs->qreqFifoHuge = (am_pkt_bulk_t *)
+            ((uintptr_t) qptrs->qreqFifoLong +
+             ptl->amsh_qsizes.qreqFifoLong);
+
+        /* Reply queues */
+        qptrs->qrepH = (am_ctl_blockhdr_t *)
+            ((uintptr_t) qptrs->qreqFifoHuge +
+             ptl->amsh_qsizes.qreqFifoHuge);
+
+        qptrs->qrepFifoShort = (am_pkt_short_t *)
+            ((uintptr_t) qptrs->qrepH +
+             PSMI_ALIGNUP(sizeof(am_ctl_blockhdr_t), PSMI_PAGESIZE));
+        qptrs->qrepFifoMed = (am_pkt_bulk_t *)
+            ((uintptr_t) qptrs->qrepFifoShort +
+             ptl->amsh_qsizes.qrepFifoShort);
+        qptrs->qrepFifoLong = (am_pkt_bulk_t *)
+            ((uintptr_t) qptrs->qrepFifoMed +
+             ptl->amsh_qsizes.qrepFifoMed);
+        qptrs->qrepFifoHuge = (am_pkt_bulk_t *)
+            ((uintptr_t) qptrs->qrepFifoLong +
+             ptl->amsh_qsizes.qrepFifoLong);
+
+        _IPATH_VDBG("shmidx=%d node=%d Request Hdr=%p,Pkt=%p,Med=%p,Long=%p,Huge=%p\n",
+                shmidx, i,
+                qptrs->qreqH,
+                qptrs->qreqFifoShort,
+                qptrs->qreqFifoMed,
+                qptrs->qreqFifoLong,
+                qptrs->qreqFifoHuge);
+        _IPATH_VDBG("shmidx=%d node=%d Reply   Hdr=%p,Pkt=%p,Med=%p,Long=%p,Huge=%p\n",
+                shmidx, i,
+                qptrs->qrepH,
+                qptrs->qrepFifoShort,
+                qptrs->qrepFifoMed,
+                qptrs->qrepFifoLong,
+                qptrs->qrepFifoHuge);
+    }
+
+    /* Update local shorthand pointers */
+#ifdef PSM_HAVE_SCIF
+    qptrs = &ep->amsh_qdir[shmidx].qptrs[ptl->ep->scif_mynodeid];
+#else
+    qptrs = &ep->amsh_qdir[shmidx].qptrs[0];
+#endif
+
+    ep->amsh_qdir[shmidx].qreqH = qptrs->qreqH;
+    ep->amsh_qdir[shmidx].qreqFifoShort = qptrs->qreqFifoShort;
+    ep->amsh_qdir[shmidx].qreqFifoMed = qptrs->qreqFifoMed;
+    ep->amsh_qdir[shmidx].qreqFifoLong = qptrs->qreqFifoLong;
+    ep->amsh_qdir[shmidx].qreqFifoHuge = qptrs->qreqFifoHuge;
+
+    ep->amsh_qdir[shmidx].qrepH = qptrs->qrepH;
+    ep->amsh_qdir[shmidx].qrepFifoShort = qptrs->qrepFifoShort;
+    ep->amsh_qdir[shmidx].qrepFifoMed = qptrs->qrepFifoMed;
+    ep->amsh_qdir[shmidx].qrepFifoLong = qptrs->qrepFifoLong;
+    ep->amsh_qdir[shmidx].qrepFifoHuge = qptrs->qrepFifoHuge;
 
     /* If we're updating our shmidx, we update our cached pointers */
     if (ptl->shmidx == shmidx)
-	am_hdrcache_update_short(shmidx, 
-                                 (am_ctl_qshort_cache_t *) &ptl->reqH, 
-                                 (am_ctl_qshort_cache_t *) &ptl->repH); 
+	am_hdrcache_update_short(ptl, shmidx, 
+                                 (am_ctl_qshort_cache_t *) ptl->reqH,
+                                 (am_ctl_qshort_cache_t *) ptl->repH);
 
     /* Sanity check */
     uintptr_t base_next = 
-	(uintptr_t) amsh_qdir[shmidx].qrepFifoHuge + amsh_qsizes.qrepFifoHuge;
+	(uintptr_t) ep->amsh_qdir[shmidx].qptrs[PTL_AMSH_MAX_LOCAL_NODES - 1].qrepFifoHuge + ptl->amsh_qsizes.qrepFifoHuge;
 
-    psmi_assert_always(base_next - base_this <= am_ctl_sizeof_block());
-}
-
-/**
- * Remap shared memory segment.
- *
- * This function internally handles cases where the segment has to be moved
- * in the address space to accomodate more shared memory peers.
- *
- * @param max_idx Maximum shared-memory index for which a remap is needed.
- */
-static
-psm_error_t
-am_remap_segment(ptl_t *ptl, int max_idx)
-{
-    void *prev_mmap;
-    void *mapptr;
-    int	i, err;
-
-    if (max_idx <= amsh_max_idx) {
-	_IPATH_VDBG("shm segment with max_idx=%d needs no remap (top=%d)\n", 
-		    max_idx, amsh_max_idx); 
-	return PSM_OK;
-    }
-
-    prev_mmap = (void *) amsh_shmbase;
-
-    mapptr = mremap(prev_mmap,
-		    psmi_amsh_segsize(amsh_max_idx+1),
-		    psmi_amsh_segsize(max_idx+1),
-		    MREMAP_MAYMOVE);
-    if (mapptr == MAP_FAILED) {
-	err = psmi_handle_error(NULL, PSM_SHMEM_SEGMENT_ERR,
-		"Error re-mmapping shared memory: %s", strerror(errno));
-	goto fail;
-    }
-    amsh_shmbase = (uintptr_t) mapptr;
-    amsh_dirpage = (struct am_ctl_dirpage *) amsh_shmbase;
-    amsh_blockbase = amsh_shmbase + psmi_amsh_segsize(0);
-    if (prev_mmap != mapptr) { /* newly relocated map, recreate directory */
-	for (i = 0; i <= max_idx; i++)
-	    am_update_directory(ptl, i);
-    }
-    _IPATH_PRDBG("shm segment remap from %p..%d to %p..%d (relocated=%s)\n",
-		prev_mmap, (int) psmi_amsh_segsize(amsh_max_idx+1),
-		mapptr, (int) psmi_amsh_segsize(max_idx+1),
-		prev_mmap == mapptr ? "NO" : "YES");
-    amsh_max_idx = max_idx;
-    return PSM_OK;
-
-fail:
-    return err;
+    psmi_assert_always(base_next - base_this <=
+            am_ctl_sizeof_block() * PTL_AMSH_MAX_LOCAL_NODES);
 }
 
 /* ep_epid_share_memory wrapper */
@@ -1108,7 +1025,6 @@ amsh_epaddr_add(ptl_t *ptl, psm_epid_t epid, int shmidx, psm_epaddr_t *epaddr_o)
 {
     psm_epaddr_t epaddr;
     psm_error_t err = PSM_OK;
-    int i;
 
     psmi_assert(psmi_epid_lookup(ptl->ep, epid) == NULL);
 
@@ -1118,15 +1034,17 @@ amsh_epaddr_add(ptl_t *ptl, psm_epid_t epid, int shmidx, psm_epaddr_t *epaddr_o)
         epaddr = (psm_epaddr_t) psmi_calloc(ptl->ep, PER_PEER_ENDPOINT, 
 					    1, sizeof(struct psm_epaddr));
         if (epaddr == NULL) {
-            err = PSM_NO_MEMORY;
-            goto fail;
+            return PSM_NO_MEMORY;
         }
-        psmi_assert_always(ptl->shmidx_map_epaddr[shmidx] == NULL);
+        psmi_assert_always(ptl->ep->amsh_qdir[shmidx].amsh_epaddr == NULL);
     }
+
     epaddr->ptl = ptl;
     epaddr->ptlctl = ptl->ctl;
-    for (i = 0; i < PSMI_EGRLONG_FLOWS_MAX; i++)
-	STAILQ_INIT(&epaddr->egrlong[i]);
+    STAILQ_INIT(&epaddr->egrlong);
+    epaddr->mctxt_prev = epaddr;
+    epaddr->mctxt_next = epaddr;
+    epaddr->mctxt_master = epaddr;
     epaddr->epid = epid;
     epaddr->ep = ptl->ep;
     epaddr->_shmidx = shmidx;
@@ -1135,17 +1053,20 @@ amsh_epaddr_add(ptl_t *ptl, psm_epid_t epid, int shmidx, psm_epaddr_t *epaddr_o)
     if ((err = psmi_epid_set_hostname(psm_epid_nid(epid), 
                                       psmi_gethostname(), 0)))
         goto fail;
-    ptl->shmidx_map_epaddr[shmidx] = epaddr;
-    if ((err = am_remap_segment(ptl, shmidx)))
-        goto fail;
-    am_update_directory(ptl, shmidx);
+
+    ptl->ep->amsh_qdir[shmidx].amsh_epaddr = epaddr;
+
     /* Finally, add to table */
     if ((err = psmi_epid_add(ptl->ep, epid, epaddr)))
         goto fail;
+
     _IPATH_VDBG("epaddr=%s added to ptl=%p\n",
                 psmi_epaddr_get_name(epid), ptl);
+
     *epaddr_o = epaddr;
+    return PSM_OK;
 fail:
+    if (epaddr != ptl->epaddr) psmi_free(epaddr);
     return err;
 }
 
@@ -1165,6 +1086,261 @@ struct ptl_connection_req
     /* Used for connect/disconnect */
     psm_amarg_t args[4];
 };
+
+/*
+ * function to make scif connection between nodes and exchange shared memory
+ */
+#ifdef PSM_HAVE_SCIF
+static int
+amsh_scif_send(scif_epd_t epd, void *buf, size_t len)
+{
+    int ret;
+    while (len) {
+        ret = scif_send(epd, buf, (uint32_t)len, SCIF_SEND_BLOCK);
+        if (ret < 0) {
+            if (errno == EINTR) continue;
+            return ret;
+        }
+        buf += ret;
+        len -= ret;
+    }
+    return 0;
+}
+
+static int
+amsh_scif_recv(scif_epd_t epd, void *buf, size_t len)
+{
+    int ret;
+    while (len) {
+        ret = scif_recv(epd, buf, (uint32_t)len, SCIF_RECV_BLOCK);
+        if (ret < 0) {
+            if (errno == EINTR) continue;
+            return ret;
+        }
+        buf += ret;
+        len -= ret;
+    }
+    return 0;
+}
+
+static
+psm_error_t
+amsh_scif_connect(uint16_t nodeid, uint16_t port, scif_epd_t *epd_o)
+{
+    int tries;
+    struct scif_portID portID;
+    scif_epd_t epd;
+    psm_error_t err;
+
+    epd = scif_open();
+    if (epd < 0) {
+        err = psmi_handle_error(NULL, PSM_EP_NO_RESOURCES,
+	        "scif_open failed with error %d\n", errno);
+        return err;
+    }
+
+    portID.port = port;
+    portID.node = nodeid;
+
+    _IPATH_VDBG("scif connecting to %d:%d\n", nodeid, port);
+
+    for(tries = 0; tries < psmi_scif_connect_retries; tries++) {
+        if (scif_connect(epd, &portID) >= 0) {
+            break;
+        } else if(errno != ECONNREFUSED) {
+            err = psmi_handle_error(NULL, PSM_EP_NO_RESOURCES,
+                    "scif_connect failed with error %d (%s)\n",
+                    errno, strerror(errno));
+            scif_close(epd);
+            return err;
+        }
+
+        /* Wait a bit before trying again. */
+        if(tries < 20) {
+            usleep(100000);
+        } else {
+            usleep(250000);
+        }
+    }
+
+    if(tries == psmi_scif_connect_retries) {
+        err = psmi_handle_error(NULL, PSM_EP_NO_RESOURCES,
+                "scif_connect retry limit exceeded\n");
+        return err;
+    }
+
+    *epd_o = epd;
+    return PSM_OK;
+}
+
+/* Establish a connection to a single epid. */
+static psm_error_t amsh_scif_setup(ptl_t* ptl, psm_epid_t epid)
+{
+    psm_ep_t ep = ptl->ep;
+    psm_error_t err = PSM_OK;
+    scif_epd_t epd = -1;
+    void* addr;
+    int peeridx;
+
+    /* Send this struct to identify ourselves to the peer (offset unused) */
+    /* Receive this struct to get memory mapping information. */
+    struct { off_t offset; int verno; psm_epid_t epid; } buf;
+
+    int port = (int)((epid>>32)&0xffff);
+    int nodeid = (int)((epid>>48)&0xff);
+    int shmidx = (int)((epid>>56)&0xff);
+
+    /* Skip peers on the same node */
+    if (nodeid == ep->scif_mynodeid) {
+        return PSM_OK;
+    }
+
+    /* Figure out the peer's index. */
+    /* 0        1 mynodeid 3 4 */
+    /* nodeid 0 1          3 4 */
+    if(nodeid > ep->scif_mynodeid) {
+        peeridx = (PTL_AMSH_MAX_LOCAL_PROCS * nodeid) + shmidx;
+    } else /*nodeid < ep->scif_mynodeid) */ {
+        peeridx = (PTL_AMSH_MAX_LOCAL_PROCS * (nodeid + 1)) + shmidx;
+    }
+
+    _IPATH_VDBG("%lx scif_connect to %d:%d %d %lx\n",
+            ep->epid, nodeid, port, peeridx, epid);
+
+    if(ep->amsh_qdir[peeridx].amsh_epd[0] != 0) {
+        /* Already established this side of the connection; all done. */
+        return err;
+    }
+
+    buf.offset = 0;
+    buf.verno = PSMI_VERNO;
+    buf.epid = ep->epid;
+
+    err = amsh_scif_connect(nodeid, port, &epd);
+    if(err) {
+        return err;
+    }
+
+    /* Send our identification information. */
+    if (amsh_scif_send(epd, &buf, sizeof(buf))) {
+        err = psmi_handle_error(NULL, PSM_EP_NO_RESOURCES,
+                "scif_send failed: %d %s\n", errno, strerror(errno));
+        scif_close(epd);
+        return err;
+    }
+
+    /* Receive memory registration information. */
+    if(amsh_scif_recv(epd, &buf, sizeof(buf))) {
+        err = psmi_handle_error(NULL, PSM_EP_NO_RESOURCES,
+                "scif_recv failed: %d %s\n", errno, strerror(errno));
+        scif_close(epd);
+        return err;
+    }
+
+    addr = scif_mmap(NULL, am_ctl_sizeof_block() * PTL_AMSH_MAX_LOCAL_NODES,
+            SCIF_PROT_READ|SCIF_PROT_WRITE, 0, epd, buf.offset);
+    if(addr == SCIF_MMAP_FAILED) {
+        err = psmi_handle_error(NULL, PSM_EP_NO_RESOURCES,
+                "scif_mmap failed: %d %s\n", errno, strerror(errno));
+        scif_close(epd);
+        return err;
+    }
+
+    _IPATH_PRDBG("%lx scif_mmap offset %p -> %p to addr %p -> %p length %ld\n",
+            ep->epid, (void*)buf.offset,
+            (void*)(buf.offset + am_ctl_sizeof_block() * PTL_AMSH_MAX_LOCAL_NODES),
+            addr,
+            (void*)((uintptr_t)addr + am_ctl_sizeof_block() * PTL_AMSH_MAX_LOCAL_NODES),
+            am_ctl_sizeof_block() * PTL_AMSH_MAX_LOCAL_NODES);
+
+    ep->amsh_qdir[peeridx].amsh_offset = buf.offset;
+    ep->amsh_qdir[peeridx].amsh_base = addr;
+    ep->amsh_qdir[peeridx].amsh_epid = buf.epid;
+    ep->amsh_qdir[peeridx].amsh_verno = buf.verno;
+
+    /* Calculate my index from the peer's perspective. */
+    /* 0        1 mynodeid 3 4 */
+    /* nodeid   0 1        3 4 */
+    if(ep->scif_mynodeid < nodeid) {
+        ep->amsh_qdir[peeridx].amsh_shmidx =
+            (PTL_AMSH_MAX_LOCAL_PROCS * (ep->scif_mynodeid + 1)) +
+            ep->amsh_shmidx;
+    } else {
+        ep->amsh_qdir[peeridx].amsh_shmidx =
+            (PTL_AMSH_MAX_LOCAL_PROCS * ep->scif_mynodeid) +
+            ep->amsh_shmidx;
+    }
+
+    /* There are eventually two connections.  epd[0] always has the remote
+       memory mapped region associated with it, and is used to make requests
+       to that peer.  epd[1] exposes our local shared memory, and is used
+       to respond to remote requests. */
+    ep->amsh_qdir[peeridx].amsh_epd[0] = epd;
+
+    am_update_directory(ptl, peeridx);
+
+    _IPATH_VDBG("shmidx %d connected! set peeridx %d amsh_shmidx %d epd %d\n",
+            ep->amsh_shmidx, peeridx,
+            ep->amsh_qdir[peeridx].amsh_shmidx,
+            ep->amsh_qdir[peeridx].amsh_epd[0]);
+    return err;
+}
+
+static
+psm_error_t
+amsh_scif_detach(psm_ep_t ep)
+{
+    int i;
+    int size = am_ctl_sizeof_block() * PTL_AMSH_MAX_LOCAL_NODES;
+
+    /* do the rest scif cleanup work */
+    for (i = 0; i < ep->scif_nnodes*PTL_AMSH_MAX_LOCAL_PROCS; i++) {
+	if (ep->amsh_qdir[i].amsh_epd[0] == 0) continue;
+
+        if(i >= PTL_AMSH_MAX_LOCAL_PROCS) {
+            if(scif_munmap(ep->amsh_qdir[i].amsh_base, size)) {
+                _IPATH_INFO("SCIF: unmapping addr %p length %d failed: (%d) %s\n",
+                        ep->amsh_qdir[i].amsh_base, size,
+                        errno, strerror(errno));
+                return PSM_INTERNAL_ERR;
+            }
+
+            ep->amsh_qdir[i].amsh_base = NULL;
+        }
+
+	if(scif_close(ep->amsh_qdir[i].amsh_epd[0])) {
+            _IPATH_INFO("SCIF: closing epd[0] %d failed: (%d) %s\n",
+                    ep->amsh_qdir[i].amsh_epd[0],
+                    errno, strerror(errno));
+            return PSM_INTERNAL_ERR;
+        }
+
+	if(scif_close(ep->amsh_qdir[i].amsh_epd[1])) {
+            _IPATH_INFO("SCIF: closing epd[1] %d failed: (%d) %s\n",
+                    ep->amsh_qdir[i].amsh_epd[1],
+                    errno, strerror(errno));
+            return PSM_INTERNAL_ERR;
+        }
+
+        ep->amsh_qdir[i].amsh_epd[0] = 0;
+        ep->amsh_qdir[i].amsh_epd[1] = 0;
+    }
+
+    /* The accept thread will detect that the listen socket has been closed
+       and will shut down gracefully. */
+    if(scif_close(ep->scif_epd)) {
+        _IPATH_INFO("SCIF: closing listen epd %d failed: (%d) %s\n",
+                ep->scif_epd,
+                errno, strerror(errno));
+        return PSM_INTERNAL_ERR;
+    }
+
+    pthread_join(ep->scif_thread, NULL);
+
+    return PSM_OK;
+}
+
+#endif //PSM_HAVE_SCIF
 
 #define PTL_OP_CONNECT      0
 #define PTL_OP_DISCONNECT   1
@@ -1191,6 +1367,7 @@ amsh_ep_connreq_init(ptl_t *ptl,
                       sizeof(struct ptl_connection_req));
     if (req == NULL) 
         return PSM_NO_MEMORY;
+
     req->isdone = 0;
     req->op = op;
     req->numep = numep;
@@ -1198,6 +1375,12 @@ amsh_ep_connreq_init(ptl_t *ptl,
     req->phase = ptl->connect_phase;
     req->epid_mask = (int *) 
         psmi_calloc(ptl->ep, PER_PEER_ENDPOINT, numep, sizeof(int));
+
+    if (req->epid_mask == NULL) {
+	psmi_free(req);
+	return PSM_NO_MEMORY;
+    }
+
     req->epaddr = array_of_epaddr;
     req->epids = array_of_epid;
     req->errors = array_of_errors;
@@ -1238,6 +1421,15 @@ amsh_ep_connreq_init(ptl_t *ptl,
             else {
                 req->epid_mask[i] = AMSH_CMASK_PREREQ;
                 array_of_epaddr[i] = NULL;
+
+#ifdef PSM_HAVE_SCIF
+                psm_error_t err = amsh_scif_setup(ptl, req->epids[i]);
+                if(err != PSM_OK) {
+                    psmi_free(req->epid_mask);
+                    psmi_free(req);
+                    return err;
+                }
+#endif
             }
         }
         else { /* disc or abort */
@@ -1274,14 +1466,13 @@ amsh_ep_connreq_poll(ptl_t *ptl, struct ptl_connection_req *req)
 {
     int i, j, cstate, shmidx;
     psm_error_t err = PSM_OK;
-    int this_max;
     psm_epid_t epid;
     psm_epaddr_t epaddr;
 
     if (req == NULL || req->isdone)
         return PSM_OK;
 
-    psmi_assert_always(amsh_dirpage != NULL); 
+    psmi_assert_always(ptl->ep->amsh_dirpage != NULL); 
     psmi_assert_always(ptl->connect_phase == req->phase);
 
     if (req->op == PTL_OP_DISCONNECT || req->op == PTL_OP_ABORT) {
@@ -1294,14 +1485,20 @@ amsh_ep_connreq_poll(ptl_t *ptl, struct ptl_connection_req *req)
             psmi_assert(epaddr != NULL);
             if (req->epid_mask[i] == AMSH_CMASK_PREREQ) {
                 int shmidx = epaddr->_shmidx;
-                /* Make sure the target of the disconnect is still there */
-                pthread_mutex_lock((pthread_mutex_t *) &(amsh_dirpage->lock));
-                if (amsh_dirpage->shmidx_map_epid[shmidx] != epaddr->epid) {
-                    req->numep_left--;
-                    req->epid_mask[i] = AMSH_CMASK_DONE;
-                    AMSH_CSTATE_TO_SET(epaddr, NONE);
+#ifdef PSM_HAVE_SCIF
+                if (shmidx < PTL_AMSH_MAX_LOCAL_PROCS) {  /* not remote nodes */
+#endif
+                    /* Make sure the target of the disconnect is still there */
+                    pthread_mutex_lock((pthread_mutex_t *) &(ptl->ep->amsh_dirpage->lock));
+                    if (ptl->ep->amsh_dirpage->shmidx_map_epid[shmidx] != epaddr->epid) {
+                        req->numep_left--;
+                        req->epid_mask[i] = AMSH_CMASK_DONE;
+                        AMSH_CSTATE_TO_SET(epaddr, NONE);
+                    }
+                    pthread_mutex_unlock((pthread_mutex_t *) &(ptl->ep->amsh_dirpage->lock));
+#ifdef PSM_HAVE_SCIF
                 }
-                pthread_mutex_unlock((pthread_mutex_t *) &(amsh_dirpage->lock));
+#endif
             }
 
             if (req->epid_mask[i] == AMSH_CMASK_PREREQ) {
@@ -1347,34 +1544,56 @@ amsh_ep_connreq_poll(ptl_t *ptl, struct ptl_connection_req *req)
             }
         }
         if (n_prereq > 0) { 
+            char buf[32];
+            uint16_t their_verno;
+
             psmi_assert(req->numep_left > 0);
-            this_max = amsh_max_idx;
             /* Go through the list of peers we need to connect to and find out
              * if they each shared ep is mapped into shm */
-            pthread_mutex_lock((pthread_mutex_t *) &(amsh_dirpage->lock));
+            pthread_mutex_lock((pthread_mutex_t *) &(ptl->ep->amsh_dirpage->lock));
             for (i = 0; i < req->numep; i++) {
                 if (req->epid_mask[i] != AMSH_CMASK_PREREQ)
                     continue;
                 epid = req->epids[i];
                 epaddr = req->epaddr[i];
 
-                /* Go through mapped epids and find the epid we're looking for */
-                for (shmidx = -1, j = 0; j <= amsh_dirpage->max_idx; j++) {
-                    /* epid is connected and ready to go */
-	            if (amsh_dirpage->shmidx_map_epid[j] == epid) {
-                        shmidx = j;
-	                this_max = max(j, this_max);
-	                break;
+#if PSM_HAVE_SCIF
+		/* Get the peer node-ID and scif port # from epid */
+		int nodeid = (int)((epid>>48)&0xff);
+		if (nodeid != ptl->ep->scif_mynodeid) {
+                    int peeridx = (int)((epid>>56)&0xff);
+
+                    //Don't use a loop, compute the shmidx directly.
+                    if(nodeid < ptl->ep->scif_mynodeid) {
+                        shmidx =
+                            (nodeid + 1) * PTL_AMSH_MAX_LOCAL_PROCS + peeridx;
+                    } else {
+                        shmidx = nodeid * PTL_AMSH_MAX_LOCAL_PROCS + peeridx;
                     }
-                }
-                if (shmidx == -1)  /* couldn't find epid, go to next */
-                    continue;
+
+		    psmi_assert(shmidx >= PTL_AMSH_MAX_LOCAL_PROCS);
+                    their_verno = ptl->ep->amsh_qdir[shmidx].amsh_verno;
+		} else
+#endif
+                {
+                    /* Go through mapped epids and find the epid we're looking for */
+                    for (shmidx = -1, j = 0; j <=
+                            ptl->ep->amsh_dirpage->max_idx; j++) {
+                        /* epid is connected and ready to go */
+	                if (ptl->ep->amsh_dirpage->shmidx_map_epid[j] == epid) {
+                            shmidx = j;
+	                    break;
+                        }
+                    }
+
+                    if (shmidx == -1)  /* couldn't find epid, go to next */
+                        continue;
+                    their_verno = ptl->ep->amsh_dirpage->psm_verno[shmidx];
+		}
 
                 /* Before we even send the request out, check to see if
                  * versions are interoperable */
-                if (!psmi_verno_isinteroperable(amsh_dirpage->psm_verno[shmidx])) {
-                    char buf[32];
-                    uint16_t their_verno = amsh_dirpage->psm_verno[shmidx];
+                if (!psmi_verno_isinteroperable(their_verno)) {
                     snprintf(buf,sizeof buf, "%d.%d",
                             PSMI_VERNO_GET_MAJOR(their_verno),
                             PSMI_VERNO_GET_MINOR(their_verno));
@@ -1388,16 +1607,18 @@ amsh_ep_connreq_poll(ptl_t *ptl, struct ptl_connection_req *req)
                     req->epid_mask[i] = AMSH_CMASK_DONE;
                     continue;
                 }
+
                 if (epaddr != NULL) {
                     psmi_assert(epaddr->_shmidx == shmidx);
                 }
                 else if ((epaddr = psmi_epid_lookup(ptl->ep, epid)) == NULL)  {
                     if ((err = amsh_epaddr_add(ptl, epid, shmidx, &epaddr))) {
                         pthread_mutex_unlock(
-                            (pthread_mutex_t *) &(amsh_dirpage->lock));
+                            (pthread_mutex_t *) &(ptl->ep->amsh_dirpage->lock));
                         return err;
                     }
                 } 
+
                 req->epaddr[i] = epaddr;
                 req->args[0].u32w0 = PSMI_AM_CONN_REQ;
                 req->args[0].u32w1 = ptl->connect_phase;
@@ -1411,7 +1632,7 @@ amsh_ep_connreq_poll(ptl_t *ptl, struct ptl_connection_req *req)
 	        _IPATH_PRDBG("epaddr=%p, epid=%" PRIx64 " at shmidx=%d\n", 
                     epaddr, epid, shmidx);
             }
-            pthread_mutex_unlock((pthread_mutex_t *) &(amsh_dirpage->lock));
+            pthread_mutex_unlock((pthread_mutex_t *) &(ptl->ep->amsh_dirpage->lock));
         }
     }
 
@@ -1500,7 +1721,7 @@ amsh_ep_connreq_wrap(ptl_t *ptl, int op,
 {
     psm_error_t err;
     uint64_t t_start;
-    struct ptl_connection_req *req;
+    struct ptl_connection_req *req = NULL;
     int num_polls_noprogress = 0;
     static int shm_polite_attach = -1;
 
@@ -1532,9 +1753,11 @@ amsh_ep_connreq_wrap(ptl_t *ptl, int op,
         err = amsh_ep_connreq_poll(ptl, req);
         if (err == PSM_OK)
             break; /* Finished before timeout */
-        else if (err != PSM_OK_NO_PROGRESS)
+        else if (err != PSM_OK_NO_PROGRESS) {
+	    psmi_free(req->epid_mask);
+	    psmi_free(req);
 	    goto fail;
-        else if (shm_polite_attach && 
+        } else if (shm_polite_attach && 
             ++num_polls_noprogress == CONNREQ_ZERO_POLLS_BEFORE_YIELD) {
             num_polls_noprogress = 0;
 	    PSMI_PYIELD();
@@ -1543,6 +1766,24 @@ amsh_ep_connreq_wrap(ptl_t *ptl, int op,
     while (psmi_cycles_left(t_start, timeout_ns));
 
     err = amsh_ep_connreq_fini(ptl, req);
+
+    /* Ensure that both sides of all connections are established before
+       returning. This prevents MPI-level deadlocks where one rank returns from
+       here before responding to another ranks handshake and enters a barrier
+       (which does not poll PSM).  That other rank stays in PSM, never
+       receiving the handshake, and never entering the barrier: deadlock. */
+    /* This is fixed by Intel MPI 5.0. */
+#if 0
+    if(op == PTL_OP_CONNECT) {
+        while(ptl->connect_to > ptl->connect_from) {
+            psmi_poll_internal(ptl->ep, 1);
+        }
+    } else { //ABORT or DISCONNECT
+        while(ptl->connect_to < ptl->connect_from) {
+            psmi_poll_internal(ptl->ep, 1);
+        }
+    }
+#endif
 
 fail:
     return err;
@@ -1576,10 +1817,50 @@ amsh_ep_disconnect(ptl_t *ptl, int force, int numep,
                 (psm_epaddr_t *) array_of_epaddr, timeout_ns);
 }
 
+/* am_ctl_getslot_remote_inner works just like am_ctl_getslot_pkt_inner, but
+   instead of using the tail/lock in the shq, use a separate per-domain
+   tail/lock.  The queue is actually located on a remote node, but tailinfo
+   is located on the local node (and shared by peers on the same node) */
+static
+am_pkt_short_t*
+am_ctl_getslot_pkt_inner(struct amsh_qtail_info* tailinfo,
+                         volatile am_ctl_qhdr_t *shq,
+                         am_pkt_short_t *pkt0)
+{
+    am_pkt_short_t* pkt;
+    uint32_t idx;
+
+    /* Acquire a slot/packet in the remote queue. */
+    pthread_spin_lock(&tailinfo->lock);
+    idx = tailinfo->tail;
+
+    /* Careful here -- pkt is pointing to memory on a remote node, so any
+       accesses will be expensive over PCIE. */
+    pkt = (void*)((uintptr_t)pkt0 + idx * shq->elem_sz);
+    if(pkt->flag == QFREE) {
+        ips_sync_reads();
+        pkt->flag = QUSED;
+
+        tailinfo->tail += 1;
+        if(tailinfo->tail == shq->elem_cnt) {
+            tailinfo->tail = 0;
+        }
+    } else {
+        pkt = NULL;
+    }
+    pthread_spin_unlock(&tailinfo->lock);
+
+    return pkt;
+}
+
+/* AWF - leaving this code for now.  With the addition of SCIF/symmetric
+   support, all communication uses the 'remote' path. */
+#if 0
 #undef CSWAP
+/* AWF - cswap appears to be broken.. fix? */
 PSMI_ALWAYS_INLINE(
 int32_t 
-cswap(volatile int32_t *p, int32_t old_value, int32_t new_value))
+cswap(volatile uint32_t *p, uint32_t old_value, uint32_t new_value))
 {
   asm volatile ("lock cmpxchg %2, %0" :
                 "+m" (*p), "+a" (old_value) :
@@ -1606,7 +1887,7 @@ am_ctl_getslot_pkt_inner(volatile am_ctl_qhdr_t *shq, am_pkt_short_t *pkt0)
         if (shq->tail == shq->elem_cnt)
             shq->tail = 0;
     } else {
-        pkt = 0;
+        pkt = NULL;
     }
     pthread_spin_unlock(&shq->lock);
 #else
@@ -1617,11 +1898,15 @@ am_ctl_getslot_pkt_inner(volatile am_ctl_qhdr_t *shq, am_pkt_short_t *pkt0)
     } while (cswap(&shq->tail, idx, idx_next) != idx);
 
     pkt = (am_pkt_short_t *)((uintptr_t) pkt0 + idx * shq->elem_sz);
+    //AWF - why is another cswap needed here? we already have the packet..
+    //We'll wait until the packet goes from QUSED -> QFREE
+    // And as soon as it does, toggle it back to QUSED.
     while (cswap(&pkt->flag, QFREE, QUSED) !=  QFREE)
         ;
 #endif
     return pkt;
 }
+#endif
 
 /* This is safe because 'flag' is at the same offset on both pkt and bulkpkt */
 #define am_ctl_getslot_bulkpkt_inner(shq,pkt0) ((am_pkt_bulk_t *) \
@@ -1629,74 +1914,108 @@ am_ctl_getslot_pkt_inner(volatile am_ctl_qhdr_t *shq, am_pkt_short_t *pkt0)
 
 PSMI_ALWAYS_INLINE(
 am_pkt_short_t *
-am_ctl_getslot_pkt(int shmidx, int is_reply)
+am_ctl_getslot_pkt(ptl_t *ptl, int shmidx, int is_reply)
 )
 {
+    struct amsh_qtail_info* tailinfo;
     volatile am_ctl_qhdr_t   *shq;
     am_pkt_short_t  *pkt0;
-    if (!is_reply) {
-        shq  = &(amsh_qdir[shmidx].qreqH->shortq);
-        pkt0 = amsh_qdir[shmidx].qreqFifoShort; 
-    }
-    else {
-        shq  = &(amsh_qdir[shmidx].qrepH->shortq);
-        pkt0 = amsh_qdir[shmidx].qrepFifoShort; 
-    }
-    return am_ctl_getslot_pkt_inner(shq, pkt0);
+
+        /* It's not obvious, but the packet acquisition code below is accessing
+           memory mapped remotely from a peer on another SCIF node. Thus we
+           have to make sure a SCIF connection to that peer is already
+           established. */
+#ifdef PSM_HAVE_SCIF
+        if(shmidx >= PTL_AMSH_MAX_LOCAL_PROCS &&
+                ptl->ep->amsh_qdir[shmidx].amsh_epd[0] == 0) {
+            if(amsh_scif_setup(ptl, ptl->ep->amsh_qdir[shmidx].amsh_epid)
+                    != PSM_OK) {
+                psmi_handle_error(PSMI_EP_NORETURN, PSM_INTERNAL_ERR,
+                        "am_ctl_getslot_remote(): amsh_scif_setup failed");
+            }
+        }
+#endif
+
+        if(!is_reply) {
+            tailinfo = &ptl->ep->amsh_dirpage->qtails[shmidx].reqFifoShort;
+            shq  = &(ptl->ep->amsh_qdir[shmidx].qreqH->shortq);
+            pkt0 = ptl->ep->amsh_qdir[shmidx].qreqFifoShort;
+        } else {
+            tailinfo = &ptl->ep->amsh_dirpage->qtails[shmidx].repFifoShort;
+            shq  = &(ptl->ep->amsh_qdir[shmidx].qrepH->shortq);
+            pkt0 = ptl->ep->amsh_qdir[shmidx].qrepFifoShort;
+        }
+
+        return am_ctl_getslot_pkt_inner(tailinfo, shq, pkt0);
 }
 
 PSMI_ALWAYS_INLINE(
 am_pkt_bulk_t *
-am_ctl_getslot_med(int shmidx, int is_reply)
+am_ctl_getslot_med(ptl_t *ptl, int shmidx, int is_reply)
 )
 {
+    struct amsh_qtail_info* tailinfo;
     volatile am_ctl_qhdr_t   *shq;
     am_pkt_bulk_t  *pkt0;
-    if (!is_reply) {
-        shq  = &(amsh_qdir[shmidx].qreqH->medbulkq);
-        pkt0 = amsh_qdir[shmidx].qreqFifoMed; 
+
+    if(!is_reply) {
+        tailinfo = &ptl->ep->amsh_dirpage->qtails[shmidx].reqFifoMed;
+        shq  = &(ptl->ep->amsh_qdir[shmidx].qreqH->medbulkq);
+        pkt0 = ptl->ep->amsh_qdir[shmidx].qreqFifoMed; 
+    } else {
+        tailinfo = &ptl->ep->amsh_dirpage->qtails[shmidx].repFifoMed;
+        shq  = &(ptl->ep->amsh_qdir[shmidx].qrepH->medbulkq);
+        pkt0 = ptl->ep->amsh_qdir[shmidx].qrepFifoMed; 
     }
-    else {
-        shq  = &(amsh_qdir[shmidx].qrepH->medbulkq);
-        pkt0 = amsh_qdir[shmidx].qrepFifoMed; 
-    }
-    return am_ctl_getslot_bulkpkt_inner(shq, pkt0);
+
+    return (am_pkt_bulk_t*)am_ctl_getslot_pkt_inner(tailinfo,
+            shq, (am_pkt_short_t*)pkt0);
 }
 
 PSMI_ALWAYS_INLINE(
 am_pkt_bulk_t *
-am_ctl_getslot_long(int shmidx, int is_reply)
+am_ctl_getslot_long(ptl_t *ptl, int shmidx, int is_reply)
 )
 {
+    struct amsh_qtail_info* tailinfo;
     volatile am_ctl_qhdr_t   *shq;
     am_pkt_bulk_t  *pkt0;
-    if (!is_reply) {
-        shq  = &(amsh_qdir[shmidx].qreqH->longbulkq);
-        pkt0 = amsh_qdir[shmidx].qreqFifoLong; 
+
+    if(!is_reply) {
+        tailinfo = &ptl->ep->amsh_dirpage->qtails[shmidx].reqFifoLong;
+        shq  = &(ptl->ep->amsh_qdir[shmidx].qreqH->longbulkq);
+        pkt0 = ptl->ep->amsh_qdir[shmidx].qreqFifoLong; 
+    } else {
+        tailinfo = &ptl->ep->amsh_dirpage->qtails[shmidx].repFifoLong;
+        shq  = &(ptl->ep->amsh_qdir[shmidx].qrepH->longbulkq);
+        pkt0 = ptl->ep->amsh_qdir[shmidx].qrepFifoLong; 
     }
-    else {
-        shq  = &(amsh_qdir[shmidx].qrepH->longbulkq);
-        pkt0 = amsh_qdir[shmidx].qrepFifoLong; 
-    }
-    return am_ctl_getslot_bulkpkt_inner(shq, pkt0);
+
+    return (am_pkt_bulk_t*)am_ctl_getslot_pkt_inner(tailinfo,
+            shq, (am_pkt_short_t*)pkt0);
 }
 
 PSMI_ALWAYS_INLINE(
 am_pkt_bulk_t *
-am_ctl_getslot_huge(int shmidx, int is_reply)
+am_ctl_getslot_huge(ptl_t *ptl, int shmidx, int is_reply)
 )
 {
+    struct amsh_qtail_info* tailinfo;
     volatile am_ctl_qhdr_t   *shq;
     am_pkt_bulk_t  *pkt0;
-    if (!is_reply) {
-        shq  = &(amsh_qdir[shmidx].qreqH->hugebulkq);
-        pkt0 = amsh_qdir[shmidx].qreqFifoHuge; 
+
+    if(!is_reply) {
+        tailinfo = &ptl->ep->amsh_dirpage->qtails[shmidx].reqFifoHuge;
+        shq  = &(ptl->ep->amsh_qdir[shmidx].qreqH->hugebulkq);
+        pkt0 = ptl->ep->amsh_qdir[shmidx].qreqFifoHuge; 
+    } else {
+        tailinfo = &ptl->ep->amsh_dirpage->qtails[shmidx].repFifoHuge;
+        shq  = &(ptl->ep->amsh_qdir[shmidx].qrepH->hugebulkq);
+        pkt0 = ptl->ep->amsh_qdir[shmidx].qrepFifoHuge; 
     }
-    else {
-        shq  = &(amsh_qdir[shmidx].qrepH->hugebulkq);
-        pkt0 = amsh_qdir[shmidx].qrepFifoHuge; 
-    }
-    return am_ctl_getslot_bulkpkt_inner(shq, pkt0);
+
+    return (am_pkt_bulk_t*)am_ctl_getslot_pkt_inner(tailinfo,
+            shq, (am_pkt_short_t*)pkt0);
 }
 
 psmi_handlertab_t psmi_allhandlers[] = { 
@@ -1725,37 +2044,73 @@ advance_head(volatile am_ctl_qshort_cache_t *hdr))
 /* XXX this can be made faster.  Instead of checking the flag of the head, keep
  * a cached copy of the integer value of the tail and compare it against the
  * previous one we saw.
+ * AWF this trick won't work across nodes, since the receiver doesn't have
+ * access to the tail value.
  */
+
 PSMI_ALWAYS_INLINE(
 psm_error_t
 amsh_poll_internal_inner(ptl_t *ptl, int replyonly, int is_internal))
 {
     psm_error_t err = PSM_OK_NO_PROGRESS;
+
     /* poll replies */
-    if (!QISEMPTY(ptl->repH.head->flag)) {
+#ifdef PSM_HAVE_SCIF
+    int node;
+    int nnodes = ptl->ep->scif_nnodes;
+
+    for(node = 0; node < nnodes; node++) {
+        if (!QISEMPTY(ptl->repH[node].head->flag)) {
+            do {
+                ips_sync_reads();
+                process_packet(ptl, (am_pkt_short_t *) ptl->repH[node].head, 0);
+                advance_head(&ptl->repH[node]);
+                err = PSM_OK;
+            } while (!QISEMPTY(ptl->repH[node].head->flag));
+        }
+    }
+#else
+    if (!QISEMPTY(ptl->repH[0].head->flag)) {
         do {
             ips_sync_reads();
-            process_packet(ptl, (am_pkt_short_t *) ptl->repH.head, 0);
-	    advance_head(&ptl->repH);
+            process_packet(ptl, (am_pkt_short_t *) ptl->repH[0].head, 0);
+            advance_head(&ptl->repH[0]);
             err = PSM_OK;
-        } while (!QISEMPTY(ptl->repH.head->flag));
+        } while (!QISEMPTY(ptl->repH[0].head->flag));
     }
+#endif
 
     if (!replyonly) {
     /* Request queue not enable for 2.0, will be re-enabled to support long
      * replies */
-        if (!is_internal && psmi_am_reqq_fifo.first != NULL) {
-            psmi_am_reqq_drain();
+        if (!is_internal && ptl->psmi_am_reqq_fifo.first != NULL) {
+            psmi_am_reqq_drain(ptl);
             err = PSM_OK;
         }
-        if (!QISEMPTY(ptl->reqH.head->flag)) {
+
+#ifdef PSM_HAVE_SCIF
+        for(node = 0; node < nnodes; node++) {
+            if (!QISEMPTY(ptl->reqH[node].head->flag)) {
+                do {
+                    ips_sync_reads();
+                    process_packet(ptl,
+                            (am_pkt_short_t *) ptl->reqH[node].head, 1);
+                    advance_head(&ptl->reqH[node]);
+                    err = PSM_OK;
+                } while (!QISEMPTY(ptl->reqH[node].head->flag));
+            }
+        }
+#else
+        if (!QISEMPTY(ptl->reqH[0].head->flag)) {
             do {
                 ips_sync_reads();
-                process_packet(ptl, (am_pkt_short_t *) ptl->reqH.head, 1);
-	        advance_head(&ptl->reqH);
+                process_packet(ptl,
+                        (am_pkt_short_t *) ptl->reqH[0].head, 1);
+                advance_head(&ptl->reqH[0]);
                 err = PSM_OK;
-            } while (!QISEMPTY(ptl->reqH.head->flag));
+            } while (!QISEMPTY(ptl->reqH[0].head->flag));
         }
+#endif
     }
 
     if (is_internal) {
@@ -1818,23 +2173,51 @@ am_send_pkt_short(ptl_t *ptl, uint32_t destidx, uint32_t bulkidx,
     volatile am_pkt_short_t *pkt;
 
     AMSH_POLL_UNTIL(ptl, isreply,
-        (pkt = am_ctl_getslot_pkt(destidx, isreply)) != NULL);
+        (pkt = am_ctl_getslot_pkt(ptl, destidx, isreply)) != NULL);
 
+#ifdef __MIC__
+    /* On MIC, a local copy of the packet struct should be filled in, then
+       copied using one vector operation.  MIC does not have write combining,
+       and the acquired packet is in remote (via PCIE) memory, so filling in
+       each struct member will cause a separate PCIE transaction. Using a
+       single vector write reduces latency. */
+    am_pkt_short_t lcl_pkt; /* Local version of packet data */
+
+    lcl_pkt.bulkidx = bulkidx;
+    lcl_pkt.shmidx = ptl->ep->amsh_qdir[destidx].amsh_shmidx;
+    lcl_pkt.type  = fmt;
+    lcl_pkt.nargs = nargs;
+    lcl_pkt.handleridx = handleridx;
+
+    for (i = 0; i < nargs; i++)
+        lcl_pkt.args[i] = args[i];
+
+    if (fmt == AMFMT_SHORT_INLINE)
+        mq_copy_tiny((uint32_t *) &lcl_pkt.args[nargs], (uint32_t *) src, len);
+
+    /* Skip the memory fences in QMARKREADY; not necessary here. */
+    //QMARKREADY(lcl_pkt);
+    lcl_pkt.flag = QREADY;
+
+    /* Now copy the local packet data to the remote packet. */
+    memcpy((void*)pkt, &lcl_pkt, sizeof(am_pkt_short_t));
+
+#else
     /* got a free pkt... fill it in */
     pkt->bulkidx = bulkidx;
-    pkt->shmidx = ptl->shmidx; 
+    pkt->shmidx = ptl->ep->amsh_qdir[destidx].amsh_shmidx;
     pkt->type  = fmt;
     pkt->nargs = nargs;
     pkt->handleridx = handleridx;
+
     for (i = 0; i < nargs; i++)
         pkt->args[i] = args[i];
+
     if (fmt == AMFMT_SHORT_INLINE) 
         mq_copy_tiny((uint32_t *) &pkt->args[nargs], (uint32_t *) src, len);
-    _IPATH_VDBG("pkt=%p fmt=%d bulkidx=%d,flag=%d,nargs=%d,"
-                "buf=%p,len=%d,hidx=%d,value=%d\n", pkt, (int) fmt, bulkidx, 
-                pkt->flag, pkt->nargs, src, (int) len, (int) handleridx,
-                src != NULL ?  *((uint32_t *)src): 0); 
+
     QMARKREADY(pkt);
+#endif
 }
 
 /* It's probably unlikely that the alloca below is problematic, but
@@ -1846,9 +2229,15 @@ am_send_pkt_short(ptl_t *ptl, uint32_t destidx, uint32_t bulkidx,
 static char amsh_medscratch[AMMED_SZ];
 #endif
 
+#ifdef __MIC__
+#define amsh_shm_copy_short memcpy
+#define amsh_shm_copy_long  memcpy
+#define amsh_shm_copy_huge  psmi_memcpyo
+#else
 #define amsh_shm_copy_short psmi_mq_mtucpy
 #define amsh_shm_copy_long  psmi_mq_mtucpy
 #define amsh_shm_copy_huge  psmi_memcpyo
+#endif
 
 PSMI_ALWAYS_INLINE(
 int
@@ -1912,11 +2301,11 @@ psmi_amsh_generic_inner(uint32_t amtype, ptl_t *ptl, psm_epaddr_t epaddr,
                 type = AMFMT_SHORT;
 #if 1
                 AMSH_POLL_UNTIL(ptl, is_reply,
-                    (bulkpkt = am_ctl_getslot_med(destidx, is_reply)) != NULL);
+                    (bulkpkt = am_ctl_getslot_med(ptl, destidx, is_reply)) != NULL);
 #else
                 /* This version exposes a compiler bug */
                 while (1) {
-                    bulkpkt = am_ctl_getslot_med(destidx, is_reply);
+                    bulkpkt = am_ctl_getslot_med(ptl, destidx, is_reply);
                     if (bulkpkt == NULL)
                         break;
                     amsh_poll_internal(ptl, is_reply);
@@ -1951,13 +2340,16 @@ psmi_amsh_generic_inner(uint32_t amtype, ptl_t *ptl, psm_epaddr_t epaddr,
             else
                 mtu_this = is_reply ? amsh_qpkt_max.qrepFifoLong :
                                        amsh_qpkt_max.qreqFifoLong;
+
             _IPATH_VDBG("[long][%s] src=%p,dest=%p,len=%d,hidx=%d\n",
                     is_reply ? "rep" : "req", src, dst, (uint32_t)len, hidx);
+
             while (bytes_left) {
                 if (type == AMFMT_HUGE) {
                     bytes_this = min(bytes_left, mtu_this);
+
                     AMSH_POLL_UNTIL(ptl, is_reply,
-                      (bulkpkt = am_ctl_getslot_huge(destidx_l, is_reply)) != NULL);
+                      (bulkpkt = am_ctl_getslot_huge(ptl, destidx_l, is_reply)) != NULL);
                     bytes_left -= bytes_this;
                     if (bytes_left == 0)
                         type = AMFMT_HUGE_END;
@@ -1968,13 +2360,14 @@ psmi_amsh_generic_inner(uint32_t amtype, ptl_t *ptl, psm_epaddr_t epaddr,
                 else {
                     bytes_this = min(bytes_left, mtu_this);
                     AMSH_POLL_UNTIL(ptl, is_reply,
-                      (bulkpkt = am_ctl_getslot_long(destidx_l, is_reply)) != NULL);
+                      (bulkpkt = am_ctl_getslot_long(ptl, destidx_l, is_reply)) != NULL);
                     bytes_left -= bytes_this;
                     if (bytes_left == 0)
                         type = AMFMT_LONG_END;
                     bulkidx = bulkpkt->idx;
                     amsh_shm_copy_long((void *) bulkpkt->payload, src_this, 
                                        bytes_this);
+
                 }
 
                 bulkpkt->dest = (uintptr_t) dst;
@@ -1982,6 +2375,7 @@ psmi_amsh_generic_inner(uint32_t amtype, ptl_t *ptl, psm_epaddr_t epaddr,
                     (uint32_t)((uintptr_t)dst_this - (uintptr_t)dst);
                 bulkpkt->len = bytes_this;
                 QMARKREADY(bulkpkt);
+
                 am_send_pkt_short(ptl, destidx, bulkidx, type, nargs, 
                                   hidx, args, NULL, 0, is_reply);
                 src_this += bytes_this;
@@ -2043,27 +2437,25 @@ psmi_amsh_long_reply(amsh_am_token_t *tok,
    return;
 }
 
-struct am_reqq_fifo_t psmi_am_reqq_fifo = { NULL, NULL };
-
 void
-psmi_am_reqq_init()
+psmi_am_reqq_init(ptl_t *ptl)
 {
-    psmi_am_reqq_fifo.first = NULL;
-    psmi_am_reqq_fifo.lastp = &psmi_am_reqq_fifo.first;
+    ptl->psmi_am_reqq_fifo.first = NULL;
+    ptl->psmi_am_reqq_fifo.lastp = &ptl->psmi_am_reqq_fifo.first;
 }
 
 psm_error_t
-psmi_am_reqq_drain()
+psmi_am_reqq_drain(ptl_t *ptl)
 {
-    am_reqq_t *reqn = psmi_am_reqq_fifo.first;
+    am_reqq_t *reqn = ptl->psmi_am_reqq_fifo.first;
     am_reqq_t *req;
     psm_error_t err = PSM_OK_NO_PROGRESS;
 
     /* We're going to process the entire list, and running the generic handler
      * below can cause other requests to be enqueued in the queue that we're
      * processing. */
-    psmi_am_reqq_fifo.first = NULL;
-    psmi_am_reqq_fifo.lastp = &psmi_am_reqq_fifo.first;
+    ptl->psmi_am_reqq_fifo.first = NULL;
+    ptl->psmi_am_reqq_fifo.lastp = &ptl->psmi_am_reqq_fifo.first;
 
     while ((req = reqn) != NULL) {
         err = PSM_OK;
@@ -2124,8 +2516,8 @@ psmi_am_reqq_add(int amtype, ptl_t *ptl, psm_epaddr_t epaddr,
     nreq->flags = flags;
 
     nreq->next = NULL;
-    *(psmi_am_reqq_fifo.lastp) = nreq;
-    psmi_am_reqq_fifo.lastp = &nreq->next;
+    *(ptl->psmi_am_reqq_fifo.lastp) = nreq;
+    ptl->psmi_am_reqq_fifo.lastp = &nreq->next;
 }
 
 static 
@@ -2135,8 +2527,8 @@ process_packet(ptl_t *ptl, am_pkt_short_t *pkt, int isreq)
     amsh_am_token_t    tok;
     psmi_handler_fn_t  fn;
     int shmidx = pkt->shmidx;
-    
-    tok.tok.epaddr_from = ptl->shmidx_map_epaddr[shmidx];
+
+    tok.tok.epaddr_from = ptl->ep->amsh_qdir[shmidx].amsh_epaddr;
     tok.ptl = ptl;
     tok.mq = ptl->ep->mq;
     tok.shmidx = shmidx;
@@ -2148,9 +2540,22 @@ process_packet(ptl_t *ptl, am_pkt_short_t *pkt, int isreq)
     uintptr_t bulkptr;
     am_pkt_bulk_t *bulkpkt;
 
+    /* It is possible for packets to arrive (the initial ones for connection
+       establishment) before amsh_epid is set correctly.  However this can only
+       happen for peers in the same node -- those connecting inter-node via
+       SCIF will always have their epid set first.  Since our local nodeid is
+       encoded in the amsh_epid of all local proces at initialization time,
+       it can always be safely extracted here, even before the amsh_epid is
+       set to its proper value for a given peer. */
+#ifdef PSM_HAVE_SCIF
+    int nodeid = (int)((ptl->ep->amsh_qdir[shmidx].amsh_epid >> 48) & 0xff);
+#else
+    const int nodeid = 0;
+#endif
+
     fn = (psmi_handler_fn_t) psmi_allhandlers[hidx].fn;
     psmi_assert(fn != NULL);
-    psmi_assert((uintptr_t) pkt > amsh_blockbase);
+    psmi_assert((uintptr_t) pkt > ptl->ep->amsh_blockbase);
 
     if (pkt->type == AMFMT_SHORT_INLINE) {
         _IPATH_VDBG("%s inline flag=%d nargs=%d from_idx=%d pkt=%p hidx=%d\n",
@@ -2165,11 +2570,12 @@ process_packet(ptl_t *ptl, am_pkt_short_t *pkt, int isreq)
         switch (pkt->type) {
             case AMFMT_SHORT:
                 if (isreq) {
-                    bulkptr = (uintptr_t) amsh_qdir[myshmidx].qreqFifoMed;
+                    bulkptr = (uintptr_t)
+                        ptl->ep->amsh_qdir[myshmidx].qptrs[nodeid].qreqFifoMed;
                     bulkptr += bulkidx * amsh_qelemsz.qreqFifoMed;
-                }
-                else {
-                    bulkptr = (uintptr_t) amsh_qdir[myshmidx].qrepFifoMed;
+                } else {
+                    bulkptr = (uintptr_t)
+                        ptl->ep->amsh_qdir[myshmidx].qptrs[nodeid].qrepFifoMed;
                     bulkptr += bulkidx * amsh_qelemsz.qrepFifoMed;
                 }
                 break;
@@ -2178,11 +2584,13 @@ process_packet(ptl_t *ptl, am_pkt_short_t *pkt, int isreq)
                 isend = 1;
             case AMFMT_LONG:
                 if (isreq) {
-                    bulkptr = (uintptr_t) amsh_qdir[shmidx_l].qreqFifoLong;
+                    bulkptr = (uintptr_t)
+                        ptl->ep->amsh_qdir[shmidx_l].qptrs[nodeid].qreqFifoLong;
                     bulkptr += bulkidx * amsh_qelemsz.qreqFifoLong;
                 }
                 else {
-                    bulkptr = (uintptr_t) amsh_qdir[shmidx_l].qrepFifoLong;
+                    bulkptr = (uintptr_t)
+                        ptl->ep->amsh_qdir[shmidx_l].qptrs[nodeid].qrepFifoLong;
                     bulkptr += bulkidx * amsh_qelemsz.qrepFifoLong;
                 }
                 break;
@@ -2191,11 +2599,11 @@ process_packet(ptl_t *ptl, am_pkt_short_t *pkt, int isreq)
                 isend = 1;
             case AMFMT_HUGE:
                 if (isreq) {
-                    bulkptr = (uintptr_t) amsh_qdir[shmidx_l].qreqFifoHuge;
+                    bulkptr = (uintptr_t) ptl->ep->amsh_qdir[shmidx_l].qptrs[nodeid].qreqFifoHuge;
                     bulkptr += bulkidx * amsh_qelemsz.qreqFifoHuge;
                 }
                 else {
-                    bulkptr = (uintptr_t) amsh_qdir[shmidx_l].qrepFifoHuge;
+                    bulkptr = (uintptr_t) ptl->ep->amsh_qdir[shmidx_l].qptrs[nodeid].qrepFifoHuge;
                     bulkptr += bulkidx * amsh_qelemsz.qrepFifoHuge;
                 }
                 break;
@@ -2203,6 +2611,7 @@ process_packet(ptl_t *ptl, am_pkt_short_t *pkt, int isreq)
                 bulkptr = 0;
                 psmi_handle_error(PSMI_EP_NORETURN, PSM_INTERNAL_ERR,
                     "Unknown/unhandled packet type 0x%x", pkt->type);
+		return;
         }
 
         bulkpkt = (am_pkt_bulk_t *) bulkptr;
@@ -2257,11 +2666,42 @@ amsh_mq_rndv(ptl_t *ptl, psm_mq_t mq, psm_mq_req_t req,
     args[1].u64w0 = tag;
     args[2].u64w0 = (uint64_t)(uintptr_t) req;
     args[3].u64w0 = (uint64_t)(uintptr_t) buf;
-    /* If KNEM Get is active register region for peer to get from */
-    if (psmi_kassist_mode == PSMI_KASSIST_KNEM_GET) 
-      args[4].u64w0 = knem_register_region((void*) buf, len, PSMI_FALSE);
-    else
-      args[4].u64w0 = 0; 
+
+    /* OK so we want to use SCIF DMA here if enabled.
+       First check: same node?  Use existing local path.
+    */
+
+#ifdef PSM_HAVE_SCIF
+    int shmidx = epaddr->_shmidx;
+    if(shmidx < PTL_AMSH_MAX_LOCAL_PROCS) {
+#endif
+        /* Intra-node: consider using kassist methods */
+        if (ptl->ep->psmi_kassist_mode == PSMI_KASSIST_KNEM_GET)
+            /* If KNEM Get is active register region for peer to get from */
+            args[4].u64w0 = knem_register_region((void*) buf, len, PSMI_FALSE);
+        else
+            args[4].u64w0 = 0;
+#ifdef PSM_HAVE_SCIF
+    } else {
+        /* Inter-node: use SCIF DMA */
+        if(ptl->ep->scif_dma_mode == PSMI_SCIF_DMA_GET &&
+                ptl->ep->scif_dma_threshold <= len) {
+            /* Register the memory region with SCIF and pass the offset over. */
+            off_t offset;
+
+            scif_epd_t epd = epaddr->ep->amsh_qdir[shmidx].amsh_epd[0];
+
+            err = scif_register_region(epd, (void*)buf, len, &offset);
+            if(err != PSM_OK) {
+                return err;
+            }
+
+            args[4].u64w0 = offset;
+        } else {
+            args[4].u64w0 = 0;
+        }
+    }
+#endif
     
     psmi_assert(req != NULL);
     req->type = MQE_TYPE_SEND;
@@ -2280,10 +2720,10 @@ amsh_mq_rndv(ptl_t *ptl, psm_mq_t mq, psm_mq_req_t req,
  */
 PSMI_ALWAYS_INLINE(
 psm_error_t
-amsh_mq_send_inner(ptl_t *ptl, psm_mq_t mq, psm_mq_req_t req, psm_epaddr_t epaddr, 
+amsh_mq_send_inner(psm_mq_t mq, psm_mq_req_t req, psm_epaddr_t epaddr, 
                    uint32_t flags, uint64_t tag, const void *ubuf, uint32_t len))
 {
-    psm_amarg_t args[2];
+    psm_amarg_t args[3];
     psm_error_t err = PSM_OK;
     int is_blocking = (req == NULL);
 
@@ -2294,7 +2734,7 @@ amsh_mq_send_inner(ptl_t *ptl, psm_mq_t mq, psm_mq_req_t req, psm_epaddr_t epadd
 	    args[0].u32w0 = MQ_MSG_SHORT;
 	args[1].u64 = tag;
 
-	psmi_amsh_short_request(ptl, epaddr, mq_handler_hidx, args, 2, 
+	psmi_amsh_short_request(epaddr->ptl, epaddr, mq_handler_hidx, args, 2, 
 				ubuf, len, 0);
     }
     else if (flags & PSM_MQ_FLAG_SENDSYNC)
@@ -2306,16 +2746,19 @@ amsh_mq_send_inner(ptl_t *ptl, psm_mq_t mq, psm_mq_req_t req, psm_epaddr_t epadd
 	args[0].u32w0 = MQ_MSG_LONG;
         args[0].u32w1 = len;
 	args[1].u64 = tag;
-	psmi_amsh_short_request(ptl, epaddr, mq_handler_hidx, args, 2, 
+	psmi_amsh_short_request(epaddr->ptl, epaddr, mq_handler_hidx, args, 2, 
 				buf, bytes_this, 0);
 	bytes_left -= bytes_this;
 	buf += bytes_this;
+	args[2].u32w0 = 0;
 	while (bytes_left) {
+	    args[2].u32w0 += bytes_this;
 	    bytes_this = min(bytes_left, psmi_am_max_sizes.request_short);
 	    /* Here we kind of bend the rules, and assume that shared-memory
 	     * active messages are delivered in order */
-	    psmi_amsh_short_request(ptl, epaddr, mq_handler_data_hidx, args, 
-				    2, buf, bytes_this, 0);
+	    psmi_amsh_short_request(epaddr->ptl, epaddr,
+				mq_handler_data_hidx, args, 
+				    3, buf, bytes_this, 0);
 	    buf += bytes_this;
 	    bytes_left -= bytes_this;
 	}
@@ -2329,7 +2772,7 @@ do_rendezvous:
             req->send_msglen = len;
             req->tag = tag;
         }
-        err = amsh_mq_rndv(ptl,mq,req,epaddr,tag,ubuf,len);
+        err = amsh_mq_rndv(epaddr->ptl,mq,req,epaddr,tag,ubuf,len);
 
         if (err == PSM_OK && is_blocking) { /* wait... */
 	    err = psmi_mq_wait_internal(&req);
@@ -2353,7 +2796,7 @@ do_rendezvous:
 
 static
 psm_error_t
-amsh_mq_isend(ptl_t *ptl, psm_mq_t mq, psm_epaddr_t epaddr, uint32_t flags, 
+amsh_mq_isend(psm_mq_t mq, psm_epaddr_t epaddr, uint32_t flags, 
 	      uint64_t tag, const void *ubuf, uint32_t len, void *context,
               psm_mq_req_t *req_o)
 {
@@ -2366,10 +2809,10 @@ amsh_mq_isend(ptl_t *ptl, psm_mq_t mq, psm_epaddr_t epaddr, uint32_t flags,
     req->context = context;
 
     _IPATH_VDBG("[ishrt][%s->%s][n=0][b=%p][l=%d][t=%"PRIx64"]\n", 
-        psmi_epaddr_get_name(ptl->epid),
+        psmi_epaddr_get_name(epaddr->ep->epid),
         psmi_epaddr_get_name(epaddr->epid), ubuf, len, tag);
 
-    amsh_mq_send_inner(ptl, mq, req, epaddr, flags, tag, ubuf, len);
+    amsh_mq_send_inner(mq, req, epaddr, flags, tag, ubuf, len);
 
     *req_o = req;
     return PSM_OK;
@@ -2377,13 +2820,13 @@ amsh_mq_isend(ptl_t *ptl, psm_mq_t mq, psm_epaddr_t epaddr, uint32_t flags,
 
 static
 psm_error_t
-amsh_mq_send(ptl_t *ptl, psm_mq_t mq, psm_epaddr_t epaddr, uint32_t flags, 
+amsh_mq_send(psm_mq_t mq, psm_epaddr_t epaddr, uint32_t flags, 
 	      uint64_t tag, const void *ubuf, uint32_t len)
 {
-    amsh_mq_send_inner(ptl, mq, NULL, epaddr, flags, tag, ubuf, len);
+    amsh_mq_send_inner(mq, NULL, epaddr, flags, tag, ubuf, len);
 
     _IPATH_VDBG("[shrt][%s->%s][n=0][b=%p][l=%d][t=%"PRIx64"]\n", 
-        psmi_epaddr_get_name(ptl->epid),
+        psmi_epaddr_get_name(epaddr->ep->epid),
         psmi_epaddr_get_name(epaddr->epid), ubuf, len, tag);
 
     return PSM_OK;
@@ -2394,7 +2837,7 @@ int
 psmi_epaddr_kcopy_pid(psm_epaddr_t epaddr)
 {
     int shmidx = epaddr->_shmidx;
-    return amsh_qdir[shmidx].kassist_pid;
+    return epaddr->ep->amsh_qdir[shmidx].kassist_pid;
 }
 
 static
@@ -2417,7 +2860,7 @@ psmi_kcopy_find_minor(int *minor)
 	snprintf(path, sizeof(path), "/dev/kcopy/%02d", i);
 	fd = open(path, O_WRONLY | O_EXCL);
 	if (fd >= 0) {
-	    *minor = i;
+	    *minor = kcopy_minor = i;
 	    break;
 	}
     }
@@ -2533,6 +2976,66 @@ psmi_get_kassist_mode()
   return mode;
 }
 
+#ifdef PSM_HAVE_SCIF
+static int
+psmi_get_scif_dma_mode()
+{
+    int mode = PSMI_SCIF_DMA_MODE_DEFAULT;
+    union psmi_envvar_val env_scif_dma;
+
+    if(!psmi_getenv("PSM_SCIF_DMA_MODE",
+                "PSM Shared memory SCIF DMA transport mode "
+                "(scif-put, scif-get, none)",
+                PSMI_ENVVAR_LEVEL_USER, PSMI_ENVVAR_TYPE_STR,
+                (union psmi_envvar_val) PSMI_SCIF_DMA_MODE_DEFAULT_STRING,
+                &env_scif_dma))
+    {
+        char *s = env_scif_dma.e_str;
+        if (strcasecmp(s, "scif-put") == 0)
+            mode = PSMI_SCIF_DMA_PUT;
+        else if (strcasecmp(s, "scif-get") == 0)
+            mode = PSMI_SCIF_DMA_GET;
+        else
+            mode = PSMI_SCIF_DMA_OFF;
+    }
+
+    return mode;
+}
+
+static int
+psmi_get_scif_dma_threshold()
+{
+    int threshold = PSMI_MQ_RV_THRESH_SCIF_DMA;
+    union psmi_envvar_val env_scif_dma;
+
+    if(!psmi_getenv("PSM_SCIF_DMA_THRESH",
+                "PSM SCIF DMA (rendezvous) switchover",
+                PSMI_ENVVAR_LEVEL_USER, PSMI_ENVVAR_TYPE_UINT,
+                (union psmi_envvar_val) threshold,
+                &env_scif_dma)) {
+        threshold = env_scif_dma.e_uint;
+    }
+
+    return threshold;
+}
+
+static
+const char *
+psmi_scif_dma_getmode(int mode)
+{
+    switch (mode) {
+        case PSMI_SCIF_DMA_OFF:
+	    return "SCIF DMA off";
+	case PSMI_SCIF_DMA_PUT:
+	    return "SCIF put";
+	case PSMI_SCIF_DMA_GET:
+	    return "SCIF get";
+	default:
+	    return "unknown";
+    }
+}
+#endif // PSM_HAVE_SCIF
+
 /* Connection handling for shared memory AM.
  *
  * arg0 => conn_op, result (PSM error type)
@@ -2569,8 +3072,6 @@ amsh_conn_handler(void *toki, psm_amarg_t *args, int narg, void *buf, size_t len
 
             epaddr = psmi_epid_lookup(ptl->ep, epid);
             if (epaddr == NULL) {
-                uintptr_t args_segoff =
-                    (uintptr_t) args - amsh_blockbase;
                 /* This can be nasty.  If the segment moves as a result of
                  * adding a new peer, we have to fix the input pointer 'args'
                  * since it comes from a shared memory location */
@@ -2578,8 +3079,9 @@ amsh_conn_handler(void *toki, psm_amarg_t *args, int narg, void *buf, size_t len
                     /* Unfortunately, no way out of here yet */
                     psmi_handle_error(PSMI_EP_NORETURN, err, "Fatal error "
 		     "in connecting to shm segment"); 
-                args = (psm_amarg_t *) (amsh_blockbase + args_segoff);
+                psmi_assert(psmi_epid_lookup(ptl->ep, epid) != NULL);
             }
+
             /* Do some version comparison, error checking if required. */
             /* Rewrite args */
             ptl->connect_from++;
@@ -2590,6 +3092,7 @@ amsh_conn_handler(void *toki, psm_amarg_t *args, int narg, void *buf, size_t len
             tok->tok.epaddr_from = epaddr; /* adjust token */
             psmi_amsh_short_reply(tok, amsh_conn_handler_hidx, 
                                   args, narg, NULL, 0, 0);
+
             break;
 
         case PSMI_AM_CONN_REP: 
@@ -2597,12 +3100,10 @@ amsh_conn_handler(void *toki, psm_amarg_t *args, int narg, void *buf, size_t len
                 _IPATH_VDBG("Out of phase connect reply\n");
                 return;
             }
-            epaddr = ptl->shmidx_map_epaddr[shmidx];
+            epaddr = ptl->ep->amsh_qdir[shmidx].amsh_epaddr;
             *perr = err;
             AMSH_CSTATE_TO_SET(epaddr, REPLIED);
             ptl->connect_to++;
-            _IPATH_VDBG("CCC epaddr=%s connected to ptl=%p\n",
-                    psmi_epaddr_get_name(epaddr->epid), ptl);
             break;
 
         case PSMI_AM_DISC_REQ: 
@@ -2614,16 +3115,22 @@ amsh_conn_handler(void *toki, psm_amarg_t *args, int narg, void *buf, size_t len
             /* Before sending the reply, make sure the process
              * is still connected */
 
-            pthread_mutex_lock((pthread_mutex_t *) &(amsh_dirpage->lock));
-            if (amsh_dirpage->shmidx_map_epid[shmidx] != epaddr->epid) 
-                is_valid = 0;
-            else
-                is_valid = 1;
-            pthread_mutex_unlock((pthread_mutex_t *) &(amsh_dirpage->lock));
-            
-            if (is_valid)
+	    is_valid = 1;
+#ifdef PSM_HAVE_SCIF
+            if (shmidx < PTL_AMSH_MAX_LOCAL_PROCS) {
+#endif
+                pthread_mutex_lock((pthread_mutex_t *) &(ptl->ep->amsh_dirpage->lock));
+                if (ptl->ep->amsh_dirpage->shmidx_map_epid[shmidx] != epaddr->epid)
+                    is_valid = 0;
+                pthread_mutex_unlock((pthread_mutex_t *) &(ptl->ep->amsh_dirpage->lock));
+#ifdef PSM_HAVE_SCIF
+            }
+#endif
+
+            if (is_valid) {
                 psmi_amsh_short_reply(tok, amsh_conn_handler_hidx, 
                                   args, narg, NULL, 0, 0);
+	    }
             break;
 
         case PSMI_AM_DISC_REP: 
@@ -2662,12 +3169,28 @@ static
 psm_error_t 
 amsh_init(psm_ep_t ep, ptl_t *ptl, ptl_ctl_t *ctl)
 {
+    int shmidx;
     psm_error_t err = PSM_OK;
 
+    _IPATH_VDBG("PSM Symmetric Mode!\n");
     /* Preconditions */
     psmi_assert_always(ep != NULL);
     psmi_assert_always(ep->epaddr != NULL);
     psmi_assert_always(ep->epid != 0);
+
+    /* Setup scif listen port and query node information */
+    /* This is important to get the node count for initializing queues */
+#ifdef PSM_HAVE_SCIF
+    if ((err = amsh_scif_init(ep)))
+	goto fail;
+#endif
+
+    /* If we haven't attached to the segment yet, do it now */
+    if ((err = psmi_shm_attach(ep, &shmidx)))
+	goto fail;
+
+    /* Modify epid with acquired info as below */
+    ep->epid |= ((((uint64_t)shmidx)&0xFF)<<56);
 
     ptl->ep     = ep; /* back pointer */
     ptl->epid   = ep->epid; /* cache epid */
@@ -2680,10 +3203,13 @@ amsh_init(psm_ep_t ep, ptl_t *ptl, ptl_ctl_t *ctl)
     ptl->connect_from = 0;
     ptl->connect_to = 0;
 
+    memset(&ptl->amsh_empty_shortpkt, 0, sizeof ptl->amsh_empty_shortpkt);
+    memset(&ptl->psmi_am_reqq_fifo, 0, sizeof ptl->psmi_am_reqq_fifo);
+
     if ((err = amsh_init_segment(ptl)))
         goto fail;
 
-    psmi_am_reqq_init();
+    psmi_am_reqq_init(ptl);
     memset(ctl, 0, sizeof(*ctl));
 
     /* Fill in the control structure */
@@ -2702,6 +3228,18 @@ amsh_init(psm_ep_t ep, ptl_t *ptl, ptl_ctl_t *ctl)
     ctl->epaddr_stats_num  = NULL;
     ctl->epaddr_stats_init = NULL;
     ctl->epaddr_stats_get  = NULL;
+
+#ifdef PSM_HAVE_SCIF
+    /* Start a thread to service incoming SCIF connections. */
+    if (pthread_create(&ptl->ep->scif_thread, NULL,
+                am_ctl_accept_thread, (void*)ptl)) {
+	err = psmi_handle_error(NULL, PSM_EP_NO_RESOURCES,
+                "amsh_init_segment(): pthread_create() failed: %d %s",
+                errno, strerror(errno));
+	goto fail;
+    }
+#endif
+
 fail:
     return err;
 }
@@ -2740,6 +3278,9 @@ amsh_fini(ptl_t *ptl, int force, uint64_t timeout_ns)
             psmi_calloc(ptl->ep, UNDEFINED, num_disc, sizeof(psm_epaddr_t));
 
 	if (errs == NULL || epaddr_array == NULL || mask == NULL) {
+	    if (epaddr_array) psmi_free(epaddr_array);
+	    if (errs) psmi_free(errs);
+	    if (mask) psmi_free(mask);
 	    err = PSM_NO_MEMORY;
 	    goto fail;
 	}
@@ -2762,6 +3303,11 @@ amsh_fini(ptl_t *ptl, int force, uint64_t timeout_ns)
         psmi_free(epaddr_array);
     }
 
+    //At this point we are never getting a disconnect request from two peers.
+    //Those peers are polling.. waiting for a response?
+    //Are we somehow losing a message that arrives somewhere between where we
+    //start to disconnect, and here?
+
     if (ptl->connect_from > 0 || ptl->connect_to > 0) {
         while (ptl->connect_from > 0 || ptl->connect_to > 0) {
             if (!psmi_cycles_left(t_start, timeout_ns)) {
@@ -2774,20 +3320,28 @@ amsh_fini(ptl_t *ptl, int force, uint64_t timeout_ns)
 	    psmi_poll_internal(ptl->ep, 1);
         }
     }
-    else
+    else {
         _IPATH_VDBG("CCC complete disconnect from=%d,to=%d\n", 
                 ptl->connect_from,
                 ptl->connect_to);
+    }
 
-    if ((err_seg = psmi_shm_detach())) {
+    if ((err_seg = psmi_shm_detach(ptl->ep))) {
         err = err_seg;
         goto fail;
     }
 
     /* This prevents poll calls between now and the point where the endpoint is
      * deallocated to reference memory that disappeared */
-    ptl->repH.head  = &amsh_empty_shortpkt;
-    ptl->reqH.head  = &amsh_empty_shortpkt;
+#ifdef PSM_HAVE_SCIF
+    for(i = 0; i < ptl->ep->scif_nnodes; i++) {
+        ptl->repH[i].head  = &ptl->amsh_empty_shortpkt;
+        ptl->reqH[i].head  = &ptl->amsh_empty_shortpkt;
+    }
+#else
+    ptl->repH[0].head  = &ptl->amsh_empty_shortpkt;
+    ptl->reqH[0].head  = &ptl->amsh_empty_shortpkt;
+#endif
 
     return PSM_OK;
 fail:
@@ -2818,4 +3372,121 @@ struct ptl_ctl_init
 psmi_ptl_amsh = { 
   amsh_sizeof, amsh_init, amsh_fini, amsh_setopt, amsh_getopt
 };
+
+#ifdef PSM_HAVE_SCIF
+/* Wait for incoming connections on the SCIF listen socket.
+   When a connection arrives, store the SCIF socket in the correct place and
+   respond so that the remote process can map our shared queue area.
+ */
+static void* am_ctl_accept_thread(void* arg)
+{
+    ptl_t* ptl = (ptl_t*)arg;
+    psm_ep_t ep = ptl->ep;
+    struct scif_portID peer;
+    scif_epd_t epd;
+    void* addr;
+    int peeridx;
+    int shmidx;
+    int nodeid;
+
+    /* Receive this struct to ID the peer (offset unused). */
+    /* Send this struct to share memory mapping information. */
+    struct { off_t offset; int verno; psm_epid_t epid; } inbuf, outbuf;
+
+    while(1) {
+        /* Block on accepting a new connection on the SCIF listen socket. */
+        if(scif_accept(ep->scif_epd, &peer, &epd, SCIF_ACCEPT_SYNC)) {
+            if(errno == EINTR) {
+                /* Time to quit! */
+                _IPATH_VDBG("SCIF accept thread quitting\n");
+                pthread_exit(NULL);
+                return NULL;
+            }
+
+	    psmi_handle_error(PSMI_EP_NORETURN, PSM_INTERNAL_ERR,
+                    "scif_accept failed: %d %s\n", errno, strerror(errno));
+            continue;
+        }
+
+        /* Register the shared memory area this peer should access. */
+        /* SCIF_MAP_FIXED is use to ensure that offset == addr, so that the
+           returned offset does not need to be tracked as well. */
+        addr = ep->amsh_qdir[ep->amsh_shmidx].amsh_base;
+        outbuf.offset = scif_register(epd, addr,
+                am_ctl_sizeof_block() * PTL_AMSH_MAX_LOCAL_NODES,
+                (off_t)addr, SCIF_PROT_READ|SCIF_PROT_WRITE, SCIF_MAP_FIXED);
+
+        _IPATH_PRDBG("registered addr %p at offset %p length %ld\n",
+                addr, (void*)outbuf.offset,
+                am_ctl_sizeof_block() * PTL_AMSH_MAX_LOCAL_NODES);
+        if(outbuf.offset == SCIF_REGISTER_FAILED) {
+            psmi_handle_error(NULL, PSM_EP_NO_RESOURCES,
+                    "scif_register failed: %d %s\n", errno, strerror(errno));
+            scif_close(epd);
+            continue;
+        }
+
+        outbuf.verno = PSMI_VERNO;
+        outbuf.epid = ep->epid;
+
+        if (amsh_scif_send(epd, &outbuf, sizeof(outbuf))) {
+            psmi_handle_error(NULL, PSM_EP_NO_RESOURCES,
+                    "scif_send epd %d failed: %d %s\n",
+                    epd, errno, strerror(errno));
+            scif_close(epd);
+            continue;
+        }
+
+        /* Receive peer identification information */
+        if(amsh_scif_recv(epd, &inbuf, sizeof(inbuf))) {
+            psmi_handle_error(NULL, PSM_EP_NO_RESOURCES,
+                    "scif_recv failed: %d %s\n", errno, strerror(errno));
+            scif_close(epd);
+            continue;
+        }
+
+        /* Extract information from the peer's epid. */
+        nodeid = (int)((inbuf.epid>>48)&0xff);
+        shmidx = (int)((inbuf.epid>>56)&0xff);
+
+        /* Port isn't supposed to match -- we have the peer's listen port,
+           which won't be the same as the connect socket's port. */
+        if(peer.node != nodeid) {
+            psmi_handle_error(NULL, PSM_EP_NO_RESOURCES,
+                    "SCIF node:port %d:%d does not match encoded epid nodeid %d",
+                    peer.node, peer.port, nodeid);
+            scif_close(epd);
+            continue;
+        }
+
+        /* Now that the peer's identity is known, store the new connection. */
+        /* 0        1 mynodeid 3 4 */
+        /* mynodeid 0 1        3 4 */
+        if(nodeid > ep->scif_mynodeid) {
+            peeridx = (PTL_AMSH_MAX_LOCAL_PROCS * nodeid) + shmidx;
+        } else if(nodeid < ep->scif_mynodeid) {
+            peeridx = (PTL_AMSH_MAX_LOCAL_PROCS * (nodeid + 1)) + shmidx;
+        } else {
+            peeridx = shmidx;
+        }
+
+        ptl->ep->amsh_qdir[peeridx].amsh_epid = inbuf.epid;
+        ptl->ep->amsh_qdir[peeridx].amsh_verno = inbuf.verno;
+
+        /* There are eventually two connections.  epd[0] always has the remote
+           memory mapped region associated with it, and is used to make requests
+           to that peer.  epd[1] exposes our local shared memory, and is used
+           to respond to remote requests. */
+        ptl->ep->amsh_qdir[peeridx].amsh_epd[1] = epd;
+
+        _IPATH_VDBG(
+                "shmidx %d accepted %d:%d peeridx %d epd %d shmidx %d\n",
+                ep->amsh_shmidx, peer.node, peer.port, peeridx,
+                ep->amsh_qdir[peeridx].amsh_epd[1],
+                ep->amsh_qdir[peeridx].amsh_shmidx);
+    }
+
+    return NULL;
+}
+#endif //PSM_HAVE_SCIF
 

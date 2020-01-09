@@ -1,4 +1,5 @@
 /*
+ * Copyright (c) 2013. Intel Corporation. All rights reserved.
  * Copyright (c) 2006-2012. QLogic Corporation. All rights reserved.
  * Copyright (c) 2003-2006, PathScale, Inc. All rights reserved.
  *
@@ -35,12 +36,22 @@
 #define _PTL_FWD_AMSH_H
 
 #define PTL_AMSH_MAX_LOCAL_PROCS   256
+
+/* SCIF manual says it is optimized for up to 8 nodes, so choose 16 for
+   future expansion. */
+#ifdef PSM_HAVE_SCIF
+#define PTL_AMSH_MAX_LOCAL_NODES   8
+#else
+/* Compiling without SCIF: assume one node */
+#define PTL_AMSH_MAX_LOCAL_NODES   1
+#endif
+
 /* Symbol in am ptl */
 struct ptl_ctl_init psmi_ptl_amsh;
 
 /* Special non-ptl function exposed to pre-attach to shm segment */
-psm_error_t psmi_shm_attach(const psm_uuid_t uuid_key, int *shmidx_o);
-psm_error_t psmi_shm_detach();
+psm_error_t psmi_shm_attach(psm_ep_t ep, int *shmidx_o);
+psm_error_t psmi_shm_detach(psm_ep_t ep);
 
 extern int psmi_shm_mq_rv_thresh;
 

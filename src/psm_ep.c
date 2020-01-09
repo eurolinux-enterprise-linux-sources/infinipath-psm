@@ -1,4 +1,5 @@
 /*
+ * Copyright (c) 2013. Intel Corporation. All rights reserved.
  * Copyright (c) 2006-2012. QLogic Corporation. All rights reserved.
  * Copyright (c) 2003-2006, PathScale, Inc. All rights reserved.
  *
@@ -45,6 +46,8 @@
  * Endpoint management
  */
 psm_ep_t psmi_opened_endpoint = NULL; 
+int psmi_opened_endpoint_count = 0;
+
 static psm_error_t psmi_ep_open_device(const psm_ep_t ep, 
 			    const struct psm_ep_open_opts *opts,
 			    const psm_uuid_t unique_job_key,
@@ -90,6 +93,130 @@ __psm_ep_num_devunits(uint32_t *num_units_o)
 }
 PSMI_API_DECL(psm_ep_num_devunits)
 
+static int
+cmpfunc(const void *p1, const void *p2)
+{
+    uint64_t a = ((uint64_t *)p1)[0];
+    uint64_t b = ((uint64_t *)p2)[0];
+    if (a < b) return -1;
+    if (a == b) return 0;
+    return 1;
+}
+static psm_error_t
+psmi_ep_multirail(int *num_rails, uint32_t *unit, uint16_t *port)
+{
+    uint32_t num_units;
+    uint64_t gid_hi, gid_lo;
+    int i, j, ret, count=0;
+    char *env;
+    psm_error_t err = PSM_OK;
+    uint64_t gidh[IPATH_MAX_UNIT][3];
+
+    env = getenv("PSM_MULTIRAIL");
+    if (!env || atoi(env) == 0) {
+	*num_rails = 0;
+	return err;
+    }
+#ifdef __MIC__
+    env = getenv("MPI_LOCALRANKID");
+    if (!env || atoi(env) == 0) {
+	_IPATH_INFO("PSM_MULTIRAIL is not supported and "
+			"ignored for this PSM mic version.\n");
+    }
+    *num_rails = 0;
+    return err;
+#endif
+
+/*
+ * map is in format: unit:port,unit:port,...
+ */
+    if ((env = getenv("PSM_MULTIRAIL_MAP"))) {
+	if (sscanf(env, "%d:%d", &i, &j) == 2) {
+	    char *comma = strchr(env, ',');
+	    unit[count] = i;
+	    port[count] = j;
+	    count++;
+	    while (comma) {
+		if (sscanf(comma, ",%d:%d", &i, &j) != 2) {
+		    break;
+		}
+		unit[count] = i;
+		port[count] = j;
+		count++;
+		if (count == IPATH_MAX_UNIT) break;
+		comma = strchr(comma+1, ',');
+	    }
+	}
+	*num_rails = count;
+
+/*
+ * Check if any of the port is not usable.
+ */
+	for (i = 0; i < count; i++) {
+	    ret = ipath_get_port_lid(unit[i], port[i]);
+	    if (ret == -1) {
+		err = psmi_handle_error(NULL, PSM_EP_DEVICE_FAILURE,
+			    "Couldn't get lid for unit %d:%d",
+			    unit[i], port[i]);
+		return err;
+	    }
+	    ret = ipath_get_port_gid(unit[i], port[i], &gid_hi, &gid_lo);
+	    if (ret == -1) {
+		err = psmi_handle_error(NULL, PSM_EP_DEVICE_FAILURE,
+			    "Couldn't get gid for unit %d:%d",
+			    unit[i], port[i]);
+		return err;
+	    }
+	}
+
+	return err;
+    }
+
+    if ((err = psm_ep_num_devunits(&num_units))) {
+	return err;
+    }
+    if (num_units > IPATH_MAX_UNIT) {
+	_IPATH_INFO("Found %d units, max %d units are supported, use %d\n",
+		num_units, IPATH_MAX_UNIT, IPATH_MAX_UNIT);
+	num_units = IPATH_MAX_UNIT;
+    }
+
+/*
+ * Get all the ports with a valid lid and gid, one per unit.
+ * we don't know which number is a valid unit, we just loop
+ * over all supported numbers.
+ */
+    for (i = 0; i < IPATH_MAX_UNIT; i++) {
+	for (j = 1; j <= IPATH_MAX_PORT; j++) {
+	    ret = ipath_get_port_lid(i, j);
+	    if (ret == -1) continue;
+	    ret = ipath_get_port_gid(i, j, &gid_hi, &gid_lo);
+	    if (ret == -1) continue;
+
+	    gidh[count][0] = gid_hi;
+	    gidh[count][1] = i;
+	    gidh[count][2] = j;
+	    count++;
+	    break;
+	}
+	if (count == num_units) break;
+    }
+
+/*
+ * Sort all the ports with gidh from small to big.
+ * This is for multiple fabrics, and we use fabric with the
+ * smallest gid to make the master connection.
+ */
+    qsort(gidh, count, sizeof(uint64_t)*3, cmpfunc);
+
+    for (i = 0; i < count; i++) {
+	unit[i] = (uint32_t)gidh[i][1];
+	port[i] = (uint16_t)(uint32_t)gidh[i][2];
+    }
+    *num_rails = count;
+    return err;
+}
+
 static psm_error_t
 psmi_ep_devlids(uint16_t **lids, uint32_t *num_lids_o,
 		uint64_t my_gid_hi, uint64_t my_gid_lo)
@@ -114,7 +241,7 @@ psmi_ep_devlids(uint16_t **lids, uint32_t *num_lids_o,
 	    goto fail;
 	}
 
-	for (i = 0; i < num_units; i++) {
+	for (i = 0; i < IPATH_MAX_UNIT; i++) {
 	    int j;
 	    for (j = 1; j <= IPATH_MAX_PORT; j++) {
 		    int lid = ipath_get_port_lid(i, j);
@@ -163,10 +290,7 @@ fail:
 uint64_t
 __psm_epid_nid(psm_epid_t epid)
 {
-    uint64_t lid, context, subcontext;
-
-    PSMI_EPID_UNPACK(epid, lid, context, subcontext);
-    return lid;
+    return PSMI_EPID_GET_LID(epid);
 }
 PSMI_API_DECL(psm_epid_nid)
 
@@ -175,9 +299,7 @@ PSMI_API_DECL(psm_epid_nid)
 uint64_t
 psmi_epid_subcontext(psm_epid_t epid)
 {
-    uint64_t lid, context, subcontext;
-    PSMI_EPID_UNPACK(epid, lid, context, subcontext);
-    return subcontext;
+    return PSMI_EPID_GET_SUBCONTEXT(epid);
 }
 
 /* Currently not exposed to users, we don't acknowledge the existence of
@@ -187,26 +309,19 @@ psmi_epid_subcontext(psm_epid_t epid)
 uint64_t
 psmi_epid_hca_type(psm_epid_t epid)
 {
-  uint64_t lid, context, subcontext, hca_type, sl;
-  PSMI_EPID_UNPACK_EXT(epid, lid, context, subcontext, hca_type, sl);
-  return hca_type;
+  return PSMI_EPID_GET_HCATYPE(epid);
 }
 
 uint64_t
 psmi_epid_sl(psm_epid_t epid)
 {
-  uint64_t lid, context, subcontext, hca_type, sl;
-  PSMI_EPID_UNPACK_EXT(epid, lid, context, subcontext, hca_type, sl);
-  return sl;
+  return PSMI_EPID_GET_SL(epid);
 }
 
 uint64_t
 __psm_epid_context(psm_epid_t epid)
 {
-    uint64_t lid, context, subcontext;
-
-    PSMI_EPID_UNPACK(epid, lid, context, subcontext);
-    return context;
+    return PSMI_EPID_GET_CONTEXT(epid);
 }
 PSMI_API_DECL(psm_epid_context)
 
@@ -221,6 +336,8 @@ psm_error_t
 __psm_ep_query (int *num_of_epinfo, psm_epinfo_t *array_of_epinfo)
 {
   psm_error_t err = PSM_OK;
+  int i;
+  psm_ep_t ep;
   
   PSMI_ERR_UNLESS_INITIALIZED(NULL);
   
@@ -236,13 +353,18 @@ __psm_ep_query (int *num_of_epinfo, psm_epinfo_t *array_of_epinfo)
     return err;
   }
   
-  /* For now only one endpoint. Return info about endpoint to caller. */
-  *num_of_epinfo = 1;
-  array_of_epinfo[0].ep = psmi_opened_endpoint;
-  array_of_epinfo[0].epid = psmi_opened_endpoint->epid;
-  memcpy(array_of_epinfo[0].uuid, 
-	 (void *) psmi_opened_endpoint->key, sizeof(psm_uuid_t));
-  psmi_uuid_unparse(psmi_opened_endpoint->key, array_of_epinfo[0].uuid_str);
+  ep = psmi_opened_endpoint;
+  for (i = 0; i < *num_of_epinfo; i++) {
+	if (ep == NULL) break;
+	array_of_epinfo[i].ep = ep;
+	array_of_epinfo[i].epid = ep->epid;
+	memcpy(array_of_epinfo[i].uuid, 
+	 (void *) ep->key, sizeof(psm_uuid_t));
+	psmi_uuid_unparse(ep->key, array_of_epinfo[i].uuid_str);
+	ep = ep->user_ep_next;
+  }
+  *num_of_epinfo = i;
+
   return err;
 }
 PSMI_API_DECL(psm_ep_query)
@@ -252,6 +374,7 @@ __psm_ep_epid_lookup (psm_epid_t epid, psm_epconn_t *epconn)
 {
   psm_error_t err = PSM_OK;
   psm_epaddr_t epaddr;
+  psm_ep_t ep;
   
   PSMI_ERR_UNLESS_INITIALIZED(NULL);
 
@@ -262,37 +385,46 @@ __psm_ep_epid_lookup (psm_epid_t epid, psm_epconn_t *epconn)
     return err;
   }
   
-  epaddr = psmi_epid_lookup(psmi_opened_endpoint, epid);
-  if (!epaddr) {
-    /* Search over SL values for bug 122239. Note that function
-     * ips_get_addr_from_epid() converts a base epid to an epaddr,
-     * which can then be used to get the correct epid for this flow.
-     * However, that function is at the IPS level and not accessible 
-     * from here without breaking the layering. */
-    uint64_t lid, context, subcontext, hca_type, sl, try_sl;
-    psm_epid_t try_epid;
-    PSMI_EPID_UNPACK_EXT(epid, lid, context, subcontext, hca_type, sl);
-    for (try_sl = 0; !epaddr && try_sl < 16; try_sl++) {
-      if (try_sl != sl) {
-        try_epid = PSMI_EPID_PACK_EXT(lid, context, subcontext, hca_type,
-				      try_sl);
-        epaddr = psmi_epid_lookup(psmi_opened_endpoint, try_epid);
-      }
-    }
+  ep = psmi_opened_endpoint;
+  while (ep) {
+	epaddr = psmi_epid_lookup(ep, epid);
+	if (!epaddr) {
+	    /* Search over SL values for bug 122239. Note that function
+	     * ips_get_addr_from_epid() converts a base epid to an epaddr,
+	     * which can then be used to get the correct epid for this flow.
+	     * However, that function is at the IPS level and not accessible 
+	     * from here without breaking the layering. */
+	    uint64_t lid, context, subcontext, hca_type, sl, try_sl;
+	    psm_epid_t try_epid;
+	    lid = PSMI_EPID_GET_LID(epid);
+	    context = PSMI_EPID_GET_CONTEXT(epid);
+	    subcontext = PSMI_EPID_GET_SUBCONTEXT(epid);
+	    hca_type = PSMI_EPID_GET_HCATYPE(epid);
+	    sl = PSMI_EPID_GET_SL(epid);
+	    for (try_sl = 0; !epaddr && try_sl < 16; try_sl++) {
+	      if (try_sl != sl) {
+	        try_epid = PSMI_EPID_PACK_EXT(lid, context, subcontext,
+					      hca_type, try_sl);
+	        epaddr = psmi_epid_lookup(psmi_opened_endpoint, try_epid);
+	      }
+	    }
 
-    if (!epaddr) {
-      err =  psmi_handle_error(NULL, PSM_EPID_UNKNOWN,
-			       "Endpoint connection status unknown");
-      return err;
-    }
+	    if (!epaddr) {
+		ep = ep->user_ep_next;
+		continue;
+	    }
+	}
+  
+	/* Found connection for epid. Return info about endpoint to caller. */
+	psmi_assert_always(epaddr->ep == ep);
+	epconn->addr = epaddr;
+	epconn->ep   = epaddr->ep;
+	epconn->mq   = epaddr->ep->mq;
+	return err;
   }
   
-  /* Found connection for epid. Return info about endpoint to caller. */
-  psmi_assert_always(epaddr->ep == psmi_opened_endpoint);
-  epconn->addr = epaddr;
-  epconn->ep   = epaddr->ep;
-  epconn->mq   = epaddr->ep->mq;
-  
+  err =  psmi_handle_error(NULL, PSM_EPID_UNKNOWN,
+	     "Endpoint connection status unknown");
   return err;
 }
 PSMI_API_DECL(psm_ep_epid_lookup);
@@ -415,7 +547,7 @@ __psm_ep_open_opts_get_defaults(struct psm_ep_open_opts *opts)
 #endif
     
     opts->timeout = 30000000000LL; /* 30 sec */
-    opts->unit    = PSMI_UNIT_ID_ANY;
+    opts->unit    = IPATH_UNIT_ID_ANY;
     opts->port    = 0;
     opts->outsl    = PSMI_SL_DEFAULT;
 #if (PSM_VERNO >= 0x0107) && (PSM_VERNO <= 0x010a)
@@ -451,8 +583,9 @@ PSMI_API_DECL(psm_ep_open_opts_get_defaults)
 psm_error_t psmi_poll_noop(ptl_t *ptl, int replyonly);
 
 psm_error_t
-__psm_ep_open(psm_uuid_t const unique_job_key, struct psm_ep_open_opts const *opts_i,
-	    psm_ep_t *epo, psm_epid_t *epid)
+__psm_ep_open_internal(psm_uuid_t const unique_job_key, int *devid_enabled,
+	    struct psm_ep_open_opts const *opts_i, psm_mq_t mq,
+	    psm_ep_t *epo, psm_epid_t *epido)
 {
     psm_ep_t ep = NULL;
     uint32_t num_units;
@@ -461,26 +594,13 @@ __psm_ep_open(psm_uuid_t const unique_job_key, struct psm_ep_open_opts const *op
     psm_epaddr_t epaddr = NULL;
     char buf[128], *p, *e;
     char *old_cpuaff = NULL, *old_unit = NULL;
-    union psmi_envvar_val devs, yield_cnt, no_cpuaff, env_unit_id,
+    union psmi_envvar_val yield_cnt, no_cpuaff, env_unit_id,
 	  env_port_id, env_sl;
     size_t ptl_sizes;
     int default_cpuaff;
     struct psm_ep_open_opts opts;
     ptl_t *amsh_ptl, *ips_ptl, *self_ptl;
     int i;
-    int devid_enabled[PTL_MAX_INIT];
-
-    PSMI_ERR_UNLESS_INITIALIZED(NULL);
-
-    PSMI_PLOCK();
-
-    if (psmi_opened_endpoint != NULL) {
-	err =  psmi_handle_error(NULL, PSM_PARAM_ERR,
-	    "In PSM version %d.%d, it is not possible to open more than one "
-	    "context per process\n",
-	    PSM_VERNO_MAJOR, PSM_VERNO_MINOR);
-	goto fail;
-    }
 
     /* First get the set of default options, we overwrite with the user's
      * desired values afterwards */
@@ -533,8 +653,10 @@ __psm_ep_open(psm_uuid_t const unique_job_key, struct psm_ep_open_opts const *op
 #endif
     }
 
-    if ((err = psm_ep_num_devunits(&num_units)) != PSM_OK) 
-	goto fail;
+    if (psmi_device_is_enabled(devid_enabled, PTL_DEVID_IPS)) {
+	if ((err = psm_ep_num_devunits(&num_units)) != PSM_OK) 
+	    goto fail;
+    } else num_units = 0;
 
     /* do some error checking */
     if (opts.timeout < -1) {
@@ -542,7 +664,7 @@ __psm_ep_open(psm_uuid_t const unique_job_key, struct psm_ep_open_opts const *op
 				"Invalid timeout value %lld", 
 				(long long) opts.timeout);
 	goto fail;
-    } else if (opts.unit < -1 || opts.unit >= (int) num_units) {
+    } else if (num_units && (opts.unit < -1 || opts.unit >= IPATH_MAX_UNIT)) {
 	err = psmi_handle_error(NULL, PSM_PARAM_ERR, 
 				"Invalid Device Unit ID %d (%d units found)",
 				opts.unit, num_units);
@@ -574,14 +696,39 @@ __psm_ep_open(psm_uuid_t const unique_job_key, struct psm_ep_open_opts const *op
 	setenv("IPATH_NO_CPUAFFINITY", "1", 1);
     }
 
+#ifdef __MIC__
+    /*
+     * On MIC, we always pick unit from /sys/class/qib/ipath/unit,
+     * but only do this if there is a HCA unit.
+     */
+    if (num_units > 0) {
+	char pathname[128];
+	struct stat st;
+	FILE *fp;
+	
+	snprintf(pathname, sizeof(pathname),
+		"/sys/class/qib/ipath/unit");
+	fp = NULL;
+	if (stat(pathname, &st) || S_ISDIR(st.st_mode) ||
+	!(fp = fopen(pathname, "r")) || (fscanf(fp, "%d", &opts.unit) != 1)) {
+	    err = psmi_handle_error(NULL, PSM_EP_DEVICE_FAILURE,
+				"Couldn't read from %s", pathname);
+	    if (fp) fclose(fp);
+	    goto fail;
+	}
+	fclose(fp);
+	psmi_assert(opts.unit != IPATH_UNIT_ID_ANY);
+	psmi_assert(opts.unit < IPATH_MAX_UNIT);
+    }
+#else
     /* If a specific unit is set in the environment, use that one. */
     if (!psmi_getenv("IPATH_UNIT", "Device Unit number (-1 autodetects)",
 		    PSMI_ENVVAR_LEVEL_USER, PSMI_ENVVAR_TYPE_LONG,
-		    (union psmi_envvar_val) PSMI_UNIT_ID_ANY,
+		    (union psmi_envvar_val) IPATH_UNIT_ID_ANY,
 		    &env_unit_id)) {
 	opts.unit = env_unit_id.e_long;
 	/* set mock UNIT *just* for setaffinity */
-	if (opts.unit != PSMI_UNIT_ID_ANY) {
+	if (opts.unit != IPATH_UNIT_ID_ANY) {
 	    char buf[32];
 	    snprintf(buf, sizeof buf - 1, "%d", (int) opts.unit);
 	    buf[sizeof buf - 1] = '\0';
@@ -591,6 +738,7 @@ __psm_ep_open(psm_uuid_t const unique_job_key, struct psm_ep_open_opts const *op
 	else
 	    unsetenv("IPATH_UNIT");
     }
+#endif
 
     if (!psmi_getenv("IPATH_PORT", "IB Port number (<= 0 autodetects)",
 		    PSMI_ENVVAR_LEVEL_USER, PSMI_ENVVAR_TYPE_LONG,
@@ -635,17 +783,6 @@ __psm_ep_open(psm_uuid_t const unique_job_key, struct psm_ep_open_opts const *op
 	    (unsigned long long) opts.outvl);
 #endif
 
-    /* See which ptl devices we want to use for this ep to be opened */
-    psmi_getenv("PSM_DEVICES",
-		"Ordered list of PSM-level devices",
-		PSMI_ENVVAR_LEVEL_USER,
-		PSMI_ENVVAR_TYPE_STR,
-		(union psmi_envvar_val) PSMI_DEVICES_DEFAULT,
-		&devs);
-
-    if ((err = psmi_parse_devices(devid_enabled, devs.e_str)))
-	goto fail;
-
     ptl_sizes =
 	(psmi_device_is_enabled(devid_enabled, PTL_DEVID_SELF) ?
 	    psmi_ptl_self.sizeof_ptl() : 0) +
@@ -653,6 +790,7 @@ __psm_ep_open(psm_uuid_t const unique_job_key, struct psm_ep_open_opts const *op
 	    psmi_ptl_ips.sizeof_ptl() : 0) +
 	(psmi_device_is_enabled(devid_enabled, PTL_DEVID_AMSH) ?
 	    psmi_ptl_amsh.sizeof_ptl() : 0);
+    if (ptl_sizes == 0) return PSM_EP_NO_DEVICE;
 
     ep = (psm_ep_t) psmi_calloc(PSMI_EP_NONE, UNDEFINED, 1, 
 				sizeof(struct psm_ep) + ptl_sizes);
@@ -669,11 +807,16 @@ __psm_ep_open(psm_uuid_t const unique_job_key, struct psm_ep_open_opts const *op
     for (i = 0; i < PTL_MAX_INIT; i++)
 	ep->devid_enabled[i] = devid_enabled[i];
 
+    /* Matched Queue initialization.  We do this early because we have to
+     * make sure ep->mq exists and is valid before calling ips_do_work.
+     */
+    ep->mq = mq;
+
     /* Get ready for PTL initialization */
     memcpy(&ep->key, (void *) unique_job_key, sizeof(psm_uuid_t));
     ep->epaddr = epaddr;
     ep->shm_mbytes = opts.shm_mbytes;
-    ep->memmode = psmi_parse_memmode();
+    ep->memmode = mq->memmode;
     ep->ipath_num_sendbufs = opts.sendbufs_num;
     ep->network_pkey = (uint16_t) opts.network_pkey & PSMI_EP_OPEN_PKEY_MASK;
 #if (PSM_VERNO >= 0x010d)
@@ -696,6 +839,17 @@ __psm_ep_open(psm_uuid_t const unique_job_key, struct psm_ep_open_opts const *op
     ep->ptl_amsh.ep_poll = psmi_poll_noop;
     ep->ptl_ips.ep_poll  = psmi_poll_noop;
     ep->connections = 0;
+
+    /* Active message fields, used by psmi_shm_attach() */
+    ep->psmi_kassist_fd = -1;
+    ep->psmi_kassist_mode = 0;
+    ep->amsh_shmbase = 0;
+    ep->amsh_blockbase = 0;
+    ep->amsh_dirpage = NULL;
+    ep->amsh_keyname = NULL;
+    ep->amsh_shmfd = -1;
+    ep->amsh_shmidx = -1;
+    ep->amsh_max_idx = -1;
 
     /* See how many iterations we want to spin before yielding */
     psmi_getenv("PSM_YIELD_SPIN_COUNT",
@@ -722,7 +876,7 @@ __psm_ep_open(psm_uuid_t const unique_job_key, struct psm_ep_open_opts const *op
     }
 
     if ((err = psmi_ep_open_device(ep, &opts, unique_job_key, 
-				   &(ep->context), &ep->epid)))
+			   &(ep->context), &ep->epid)))
 	goto fail;
 
     /* Restore old cpuaffinity and unit settings.
@@ -756,7 +910,7 @@ __psm_ep_open(psm_uuid_t const unique_job_key, struct psm_ep_open_opts const *op
 	err = PSM_NO_MEMORY;
 	goto fail;
     }
-    ipath_set_mylabel(ep->context_mylabel);
+    //ipath_set_mylabel(ep->context_mylabel);
 
     if ((err = psmi_epid_set_hostname(psm_epid_nid(ep->epid), buf, 0)))
 	goto fail;
@@ -767,52 +921,143 @@ __psm_ep_open(psm_uuid_t const unique_job_key, struct psm_ep_open_opts const *op
     if ((err = psmi_am_init_internal(ep)))
 	goto fail;
 
-    /* Matched Queue initialization.  We do this early because we have to
-     * make sure ep->mq exists and is valid before calling ips_do_work.
-     */
-    if ((err = psmi_mq_malloc(ep, &ep->mq)))
-	goto fail;
-
     if (psmi_ep_device_is_enabled(ep, PTL_DEVID_SELF)) {
-	if ((err = psmi_ptl_self.init((const psm_ep_t) ep, self_ptl,
-				       &ep->ptl_self)))
+	if ((err = psmi_ptl_self.init(ep, self_ptl, &ep->ptl_self)))
 	    goto fail;
     }
     if (psmi_ep_device_is_enabled(ep, PTL_DEVID_IPS)) {
-	if ((err = psmi_ptl_ips.init((const psm_ep_t) ep, ips_ptl,
-				      &ep->ptl_ips)))
+	if ((err = psmi_ptl_ips.init(ep, ips_ptl, &ep->ptl_ips)))
 	    goto fail;
     }
     /* If we're shm-only, this device is enabled above */
     if (psmi_ep_device_is_enabled(ep, PTL_DEVID_AMSH)) {
-	if ((err = psmi_ptl_amsh.init((const psm_ep_t) ep, amsh_ptl,
-				       &ep->ptl_amsh)))
+	if ((err = psmi_ptl_amsh.init(ep, amsh_ptl, &ep->ptl_amsh)))
 	    goto fail;
     }
     else {
 	/* We may have pre-attached as part of getting our rank for enabling
 	 * shared contexts.  */ 
-	psmi_shm_detach();
+	psmi_shm_detach(ep);
     }
 
-    /* Once we've initialized all devices, we can update the MQ with its
-     * default values */
-    if ((err = psmi_mq_initialize_defaults(ep->mq)))
-	goto fail;
+    /*
+     * Keep only IPS since only IPS support multi-rail, other devices
+     * are only setup once. IPS device can come to this function again.
+     */
+    for (i = 0; i < PTL_MAX_INIT; i++) {
+	if (devid_enabled[i] != PTL_DEVID_IPS) {
+	    devid_enabled[i] = -1;
+	}
+    }
 
-    *epid    = ep->epid;
+    *epido    = ep->epid;
     *epo     = ep;
 
-    psmi_opened_endpoint = ep;
-    PSMI_PUNLOCK();
     return PSM_OK;
 
 fail:
-    PSMI_PUNLOCK();
-    if (ep != NULL)
+    if (ep != NULL) {
+	if (ep->context.fd != -1) close(ep->context.fd);
 	psmi_free(ep);
+    }
     if (epaddr != NULL)
 	psmi_free(epaddr);
+    return err;
+}
+
+psm_error_t
+__psm_ep_open(psm_uuid_t const unique_job_key, struct psm_ep_open_opts const *opts_i,
+	    psm_ep_t *epo, psm_epid_t *epido)
+{
+    psm_error_t err;
+    psm_mq_t mq;
+    psm_epid_t epid;
+    psm_ep_t ep, tmp;
+    uint32_t units[IPATH_MAX_UNIT];
+    uint16_t ports[IPATH_MAX_UNIT];
+    int i, num_rails = 0;
+    char *uname = "IPATH_UNIT";
+    char *pname = "IPATH_PORT";
+    char uvalue[4], pvalue[4];
+    int devid_enabled[PTL_MAX_INIT];
+    union psmi_envvar_val devs;
+
+    PSMI_ERR_UNLESS_INITIALIZED(NULL);
+
+    PSMI_PLOCK();
+
+    /* Matched Queue initialization.  We do this early because we have to
+     * make sure ep->mq exists and is valid before calling ips_do_work.
+     */
+    err = psmi_mq_malloc(&mq);
+    if (err != PSM_OK) goto fail;
+
+    /* See which ptl devices we want to use for this ep to be opened */
+    psmi_getenv("PSM_DEVICES",
+		"Ordered list of PSM-level devices",
+		PSMI_ENVVAR_LEVEL_USER,
+		PSMI_ENVVAR_TYPE_STR,
+		(union psmi_envvar_val) PSMI_DEVICES_DEFAULT,
+		&devs);
+
+    if ((err = psmi_parse_devices(devid_enabled, devs.e_str)))
+	goto fail;
+
+    if (psmi_device_is_enabled(devid_enabled, PTL_DEVID_IPS)) {
+	err = psmi_ep_multirail(&num_rails, units, ports);
+	if (err != PSM_OK) goto fail;
+
+	/* If multi-rail is used, set the first ep unit/port */
+	if (num_rails > 0) {
+	    snprintf(uvalue, 4, "%1d", units[0]);
+	    snprintf(pvalue, 4, "%1d", ports[0]);
+	    setenv(uname, uvalue, 1);
+	    setenv(pname, pvalue, 1);
+	}
+    }
+
+    err = __psm_ep_open_internal(unique_job_key,
+		devid_enabled, opts_i, mq, &ep, &epid);
+    if (err != PSM_OK) goto fail;
+
+    if (psmi_opened_endpoint == NULL) {
+	psmi_opened_endpoint = ep;
+    } else {
+	tmp = psmi_opened_endpoint;
+	while (tmp->user_ep_next) tmp = tmp->user_ep_next;
+	tmp->user_ep_next = ep;
+    }
+    psmi_opened_endpoint_count++;
+    ep->mctxt_prev = ep->mctxt_next = ep;
+    ep->mctxt_master = ep;
+    mq->ep = ep;
+
+    *epo = ep;
+    *epido = epid;
+
+    if (psmi_device_is_enabled(devid_enabled, PTL_DEVID_IPS)) {
+	for (i = 1; i < num_rails; i++) {
+	    snprintf(uvalue, 4, "%1d", units[i]);
+	    snprintf(pvalue, 4, "%1d", ports[i]);
+	    setenv(uname, uvalue, 1);
+	    setenv(pname, pvalue, 1);
+
+	    /* Create slave EP */
+	    err = __psm_ep_open_internal(unique_job_key,
+			devid_enabled, opts_i, mq, &tmp, &epid);
+	    if (err) goto fail;
+
+	    /* Link slave EP after master EP. */
+	    PSM_MCTXT_APPEND(ep, tmp);
+	}
+    }
+	
+    /* Once we've initialized all devices, we can update the MQ with its
+     * default values */
+    if (err == PSM_OK) err = psmi_mq_initialize_defaults(mq);
+
+fail:
+    PSMI_PUNLOCK();
     return err;
 }
 PSMI_API_DECL(psm_ep_open)
@@ -823,18 +1068,28 @@ __psm_ep_close(psm_ep_t ep, int mode, int64_t timeout_in)
     psm_error_t err = PSM_OK;
     uint64_t t_start = get_cycles();
     union psmi_envvar_val timeout_intval;
+    psm_ep_t tmp, mep;
 
     PSMI_ERR_UNLESS_INITIALIZED(ep);
+    psmi_assert_always(ep->mctxt_master == ep);
 
     PSMI_PLOCK();
 
     if (psmi_opened_endpoint == NULL) {
         err =  psmi_handle_error(NULL, PSM_EP_WAS_CLOSED,
-			         "PSM Endpoint is closed or does not exist");
+		         "PSM Endpoint is closed or does not exist");
         return err;
     }
 
-    psmi_opened_endpoint = NULL;
+    tmp = psmi_opened_endpoint;
+    while (tmp && tmp != ep) {
+	tmp = tmp->user_ep_next;
+    }
+    if (!tmp) {
+	err =  psmi_handle_error(NULL, PSM_EP_WAS_CLOSED,
+		         "PSM Endpoint is closed or does not exist");
+        return err;
+    }
 
     psmi_getenv("PSM_CLOSE_TIMEOUT",
                 "End-point close timeout over-ride.",
@@ -870,24 +1125,50 @@ __psm_ep_close(psm_ep_t ep, int mode, int64_t timeout_in)
      * timeout.  There's no good way to do this until we change the PTL
      * interface to allow asynchronous finalization
      */
-    if (psmi_ep_device_is_enabled(ep, PTL_DEVID_AMSH)) 
-	err = psmi_ptl_amsh.fini(ep->ptl_amsh.ptl, mode, timeout_in);
+    mep = ep;
+    tmp = ep->mctxt_prev;
+    do {
+	ep = tmp;
+	tmp = ep->mctxt_prev;
+	PSM_MCTXT_REMOVE(ep);
+	if (psmi_ep_device_is_enabled(ep, PTL_DEVID_AMSH)) 
+	    err = psmi_ptl_amsh.fini(ep->ptl_amsh.ptl, mode, timeout_in);
 
-    if ((err == PSM_OK || err == PSM_TIMEOUT) && 
-	psmi_ep_device_is_enabled(ep, PTL_DEVID_IPS)) 
-	err = psmi_ptl_ips.fini(ep->ptl_ips.ptl, mode, timeout_in);
+	if ((err == PSM_OK || err == PSM_TIMEOUT) && 
+	    psmi_ep_device_is_enabled(ep, PTL_DEVID_IPS)) 
+	    err = psmi_ptl_ips.fini(ep->ptl_ips.ptl, mode, timeout_in);
 
-    /* If there's timeouts in the disconnect requests, still make sure that we
-     * still get to close the endpoint and mark it closed */
-    if (psmi_ep_device_is_enabled(ep, PTL_DEVID_IPS))
-	psmi_context_close(&ep->context);
+	/* If there's timeouts in the disconnect requests,
+	 * still make sure that we still get to close the
+	 *endpoint and mark it closed */
+	if (psmi_ep_device_is_enabled(ep, PTL_DEVID_IPS))
+	    psmi_context_close(&ep->context);
 
-    psmi_free(ep->epaddr);
-    psmi_free(ep->context_mylabel);
+	psmi_free(ep->epaddr);
+	psmi_free(ep->context_mylabel);
+	/*
+	 * Before freeing the master ep itself,
+	 * remove it from the global linklist.
+	 * We do it here to let atexit handler in ptl_am directory
+	 * to search the global linklist and free the shared memory file.
+	 */
+	if (ep == mep) {
+	    if (psmi_opened_endpoint == ep) {
+		psmi_opened_endpoint = ep->user_ep_next;
+	    } else {
+		tmp = psmi_opened_endpoint;
+		while (tmp->user_ep_next != ep) {
+		    tmp = tmp->user_ep_next;
+		}
+	        tmp->user_ep_next = ep->user_ep_next;
+	    }
+	    psmi_opened_endpoint_count--;
+	}
+	psmi_free(ep);
+
+    } while ((err == PSM_OK || err == PSM_TIMEOUT) && tmp != ep);
 
     PSMI_PUNLOCK();
-
-    psmi_free(ep);
 
     _IPATH_PRDBG("Closed endpoint in %.3f secs\n",
 	    (double) cycles_to_nanosecs(get_cycles() - t_start) / SEC_ULL);
@@ -919,6 +1200,9 @@ psmi_ep_open_device(const psm_ep_t ep,
 				     opts->timeout, context)) != PSM_OK)
 	    goto fail;
 
+	_IPATH_DBG("[%d]use unit %d port %d\n", getpid(), 
+	    context->base_info.spi_unit, context->base_info.spi_port);
+
 	if ((lid = ipath_get_port_lid(context->base_info.spi_unit,
 	    context->base_info.spi_port)) == -1) {
 	    err = psmi_handle_error(NULL, 
@@ -930,11 +1214,12 @@ psmi_ep_open_device(const psm_ep_t ep,
 	if (context->base_info.spi_sw_version >= (1 << 16 | 5)) {
 	    uint32_t rcvthread_flags;
 	    union psmi_envvar_val env_rcvthread;
+	    static int norcvthread = 0; /* only for first rail */
 
 	    /* See if we want to activate support for receive thread */
 	    psmi_getenv("PSM_RCVTHREAD", "Recv thread flags (0 disables thread)",
 		    PSMI_ENVVAR_LEVEL_USER, PSMI_ENVVAR_TYPE_UINT_FLAGS,
-		    (union psmi_envvar_val) PSMI_RCVTHREAD_FLAGS,
+		    (union psmi_envvar_val)(norcvthread++?0:PSMI_RCVTHREAD_FLAGS),
 		    &env_rcvthread); 
 	    rcvthread_flags = env_rcvthread.e_uint;
 
@@ -958,6 +1243,7 @@ psmi_ep_open_device(const psm_ep_t ep,
 	int rank, nranks;
 	char *e;
 	long nproc = sysconf(_SC_NPROCESSORS_ONLN);
+
 	if (psmi_ep_device_is_enabled(ep, PTL_DEVID_AMSH)) {
 	    /* In shm-only mode, we need to derive a valid epid based on our
 	     * rank.  We try to get it from the environment if its available,
@@ -974,7 +1260,7 @@ psmi_ep_open_device(const psm_ep_t ep,
 			PSMI_ENVVAR_LEVEL_HIDDEN, PSMI_ENVVAR_TYPE_INT,
 			(union psmi_envvar_val) -1,
 			&env_rankid)) {
-		    if ((err = psmi_shm_attach(unique_job_key, &rank)))
+		    if ((err = psmi_shm_attach(ep, &rank)))
 			goto fail;
 		}
 		else

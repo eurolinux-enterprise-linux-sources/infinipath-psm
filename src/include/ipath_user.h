@@ -1,4 +1,5 @@
 /*
+ * Copyright (c) 2013. Intel Corporation. All rights reserved.
  * Copyright (c) 2006-2012. QLogic Corporation. All rights reserved.
  * Copyright (c) 2003-2006, PathScale, Inc. All rights reserved.
  *
@@ -60,6 +61,7 @@
 #include "ipath_common.h"
 #include "ipath_byteorder.h"
 #include "ipath_udebug.h"
+#include "ipath_service.h"
 
 // interval timing routines
 // Convert a count of cycles to elapsed nanoseconds
@@ -86,6 +88,36 @@ typedef struct _ipath_dev {
 
 struct _ipath_ctrl {
 	ipath_dev spc_dev;	// for use by "driver" code only, other code treats as an opaque cookie.
+
+// some local storages in some condition:
+// as storage of __ipath_rcvtidflow in ipath_userinit().
+	__le32 regs[INFINIPATH_TF_NFLOWS << 1];
+// as storage of __ipath_tidflow_wmb in ipath_userinit().
+	__le32 tidflow_wmb_location;
+// as storage of spi_sendbuf_status in ipath_userinit().
+	uint64_t sendbuf_status;
+// for ipath_check_unit_status(), ipath_proto.c
+	int lasterr;
+
+// location to which InfiniPath writes the rcvhdrtail
+// register whenever it changes, so that no chip registers are read in
+// the performance path. 
+	volatile __le32 *__ipath_rcvtail;
+// address where ur_rcvhdrhead is written
+	volatile __le32 *__ipath_rcvhdrhead;
+// address where ur_rcvegrindexhead is written
+	volatile __le32 *__ipath_rcvegrhead;
+// address where ur_rcvegrindextail is read
+	volatile __le32 *__ipath_rcvegrtail;
+// number of eager buffers
+	uint32_t __ipath_tidegrcnt;
+// address where ur_rcvtidflow is written
+	volatile __le32 *__ipath_rcvtidflow;
+// Serialize writes to tidflow QLE73XX
+	volatile __le32 *__ipath_tidflow_wmb;
+
+// save away spi_status for use in ipath_check_unit_status()
+	volatile __u64 *__ipath_spi_status;
 };
 
 // PIO write routines assume that the message header is always 56 bytes.
@@ -112,34 +144,9 @@ struct _ipath_ctrl {
 struct _ipath_ctrl *ipath_userinit(int32_t, struct ipath_user_info *,
 				   struct ipath_base_info *b);
 
-// Given the unit number and port, return an error, or the corresponding LID
-// Returns an int, so -1 indicates an error.  0 indicates that
-// the unit is valid, but no LID has been assigned.
-int ipath_get_port_lid(uint16_t, uint16_t);
-
-// Given the unit number and port, return an error, or the corresponding GID
-// Returns an int, so -1 indicates an error.
-int ipath_get_port_gid(uint16_t, uint16_t, uint64_t *hi, uint64_t *lo);
-
-// Given the unit number, return an error, or the corresponding LMC value
-// for the port
-// Returns an int, so -1 indicates an error.  0
-int ipath_get_port_lmc(uint16_t unit, uint16_t port);
-
-// Given the unit number, return an error, or the corresponding link rate
-// for the port
-// Returns an int, so -1 indicates an error. 
-int ipath_get_port_rate(uint16_t unit, uint16_t port);
-
-// Given a unit, port and SL, return an error, or the corresponding VL for the
-// SL as programmed by the SM
-// Returns an int, so -1 indicates an error.
-int ipath_get_port_sl2vl(uint16_t unit, uint16_t port, uint8_t sl);
-
-// get the number of units supported by the driver.  Does not guarantee
-// that a working chip has been found for each possible unit #.  Returns
-// -1 with errno set, or number of units >=0 (0 means none found).
-int ipath_get_num_units(void);
+// don't inline these; it's all init code, and not inlining makes the
+// overall code shorter and easier to debug
+void ipath_touch_mmap(void *, size_t) __attribute__ ((noinline));
 
 int32_t ipath_update_tid_err(void);	// handle update tid errors out of line
 int32_t ipath_free_tid_err(void);	// handle free tid errors out of line
@@ -153,8 +160,10 @@ int32_t ipath_free_tid_err(void);	// handle free tid errors out of line
 // checking.
 int32_t ipath_set_pkey(struct _ipath_ctrl *, uint16_t);
 
-void ipath_flush_egr_bufs(void);	// flush the eager buffers, by setting the
-	// eager index head register == eager index tail, if queue is full
+// flush the eager buffers, by setting the
+// eager index head register == eager index tail, if queue is full
+void ipath_flush_egr_bufs(struct _ipath_ctrl *ctrl);
+
 int ipath_wait_for_packet(struct _ipath_ctrl *);
 
 // stop_start == 0 disables receive on the context, for use in queue overflow
@@ -196,21 +205,14 @@ static int32_t __inline__ ipath_free_tid(struct _ipath_ctrl *,
 
 // check the unit status, and return an IPS_RC_* code if it is not in a
 // usable state.   It will also print a message if not in a usable state
-int ipath_check_unit_status(void);
+int ipath_check_unit_status(struct _ipath_ctrl *ctrl);
 
 // Statistics maintained by the driver
 const char * infinipath_get_next_name(char **names);
 uint64_t infinipath_get_single_stat(const char *attr, uint64_t *s);
-int infinipath_get_stats(uint64_t *, int);
-int infinipath_get_stats_names(char **namep);
 int infinipath_get_stats_names_count(void);
 // Counters maintained in the chip, globally, and per-prot
-int infinipath_get_ctrs_unit(int unitno, uint64_t *, int);
-int infinipath_get_ctrs_unit_names(int unitno, char **namep);
 int infinipath_get_ctrs_unit_names_count(int unitno);
-
-int infinipath_get_ctrs_port(int unitno, int port, uint64_t *, int);
-int infinipath_get_ctrs_port_names(int unitno, char **namep);
 int infinipath_get_ctrs_port_names_count(int unitno);
 
 uint64_t infinipath_get_single_unitctr(int unit, const char *attr, uint64_t *s);
@@ -252,6 +254,8 @@ struct ipath_pio_params {
 // in which they are filled, and writes partially filled buffers in increasing
 // address order (assuming they are filled that way).
 // The arguments are pio buffer address, payload length, header, and payload
+void ipath_write_pio_vector(volatile uint32_t *, const struct ipath_pio_params *,
+	void *, void *);  
 void ipath_write_pio(volatile uint32_t *, const struct ipath_pio_params *,
 	void *, void *);  
 void ipath_write_pio_force_order(volatile uint32_t *,
@@ -293,35 +297,30 @@ void ipath_dwordcpy_safe(volatile uint32_t *dest, const uint32_t * src, uint32_t
 // not be called until after ipath_userinit() is called.
 // The ctrl argument is currently unused, but remains useful for adding
 // debug code.
-extern volatile __le32 *__ipath_rcvhdrhead;
-extern volatile __le32 *__ipath_rcvegrhead;
-extern volatile __le32 *__ipath_rcvtail;
-extern volatile __le32 *__ipath_rcvtidflow;
-extern volatile __le32 *__ipath_tidflow_wmb;
 
 static __inline__ void ipath_put_rcvegrindexhead(struct _ipath_ctrl *ctrl,
 						 uint32_t val)
 {
-	*__ipath_rcvegrhead = __cpu_to_le32(val);
+	*ctrl->__ipath_rcvegrhead = __cpu_to_le32(val);
 }
 
 static __inline__ void ipath_put_rcvhdrhead(struct _ipath_ctrl *ctrl,
 					    uint32_t val)
 {
-	*__ipath_rcvhdrhead = __cpu_to_le32(val);
+	*ctrl->__ipath_rcvhdrhead = __cpu_to_le32(val);
 }
 
-static __inline__ uint32_t ipath_get_rcvhdrtail(void)
+static __inline__ uint32_t ipath_get_rcvhdrtail(struct _ipath_ctrl *ctrl)
 {
-    uint32_t res = __le32_to_cpu(*__ipath_rcvtail);
+    uint32_t res = __le32_to_cpu(*ctrl->__ipath_rcvtail);
     ips_rmb();
     return res;
 }
 
-static __inline__ void ipath_tidflow_set_entry(uint32_t flowid, uint8_t genval,
-					       uint16_t seqnum)
+static __inline__ void ipath_tidflow_set_entry(struct _ipath_ctrl *ctrl,
+		uint32_t flowid, uint8_t genval, uint16_t seqnum)
 {
-    __ipath_rcvtidflow[flowid << 1] = __cpu_to_le32(
+    ctrl->__ipath_rcvtidflow[flowid << 1] = __cpu_to_le32(
        (1 << INFINIPATH_TF_ISVALID_SHIFT) |
        (1 << INFINIPATH_TF_ENABLED_SHIFT) |
        (1 << INFINIPATH_TF_STATUS_SEQMISMATCH_SHIFT) |
@@ -329,25 +328,27 @@ static __inline__ void ipath_tidflow_set_entry(uint32_t flowid, uint8_t genval,
        (genval << INFINIPATH_TF_GENVAL_SHIFT) |
        ((seqnum & INFINIPATH_TF_SEQNUM_MASK) << INFINIPATH_TF_SEQNUM_SHIFT));
     /* Write a read-only register to act as a delay between tidflow writes */
-    *__ipath_tidflow_wmb = 0;
+    *ctrl->__ipath_tidflow_wmb = 0;
 }
 
-static __inline__ void ipath_tidflow_reset(uint32_t flowid)
+static __inline__ void ipath_tidflow_reset(struct _ipath_ctrl *ctrl,
+		uint32_t flowid)
 {
-    __ipath_rcvtidflow[flowid << 1] = __cpu_to_le32(
+    ctrl->__ipath_rcvtidflow[flowid << 1] = __cpu_to_le32(
            (1 << INFINIPATH_TF_STATUS_SEQMISMATCH_SHIFT) |
            (1 << INFINIPATH_TF_STATUS_GENMISMATCH_SHIFT));
     /* Write a read-only register to act as a delay between tidflow writes */
-    *__ipath_tidflow_wmb = 0;
+    *ctrl->__ipath_tidflow_wmb = 0;
 }
 
 /*
  * This should only be used for debugging.
  * Normally, we shouldn't read the chip.
  */
-static __inline__ uint32_t ipath_tidflow_get(uint32_t flowid)
+static __inline__ uint32_t ipath_tidflow_get(struct _ipath_ctrl *ctrl,
+		uint32_t flowid)
 {
-  return __le32_to_cpu(__ipath_rcvtidflow[flowid << 1]);
+  return __le32_to_cpu(ctrl->__ipath_rcvtidflow[flowid << 1]);
 }
 
 static __inline__ uint32_t ipath_tidflow_get_seqmismatch(uint32_t val)
@@ -454,7 +455,7 @@ static int32_t __inline__ ipath_update_tid(struct _ipath_ctrl *ctrl,
 	cmd.cmd.tid_info.tidlist = tidlist;	// driver copies tids back directly to this
 	cmd.cmd.tid_info.tidvaddr = vaddr;	// base address for this send to map
 	cmd.cmd.tid_info.tidmap = tidmap;	// driver copies directly to this
-	if (write(ctrl->spc_dev.spd_fd, &cmd, sizeof(cmd)) == -1)
+	if (ipath_cmd_write(ctrl->spc_dev.spd_fd, &cmd, sizeof(cmd)) == -1)
 		return ipath_update_tid_err();
 	return 0;
 }
@@ -468,7 +469,7 @@ static int32_t __inline__ ipath_free_tid(struct _ipath_ctrl *ctrl,
 
 	cmd.cmd.tid_info.tidcnt = tidcnt;
 	cmd.cmd.tid_info.tidmap = tidmap;	// driver copies from this
-	if (write(ctrl->spc_dev.spd_fd, &cmd, sizeof(cmd)) == -1)
+	if (ipath_cmd_write(ctrl->spc_dev.spd_fd, &cmd, sizeof(cmd)) == -1)
 		return ipath_free_tid_err();
 	return 0;
 }
@@ -524,49 +525,5 @@ int ipathd_reset_hardware(uint32_t);
 
 int ipath_hideous_ioctl_emulator(int unit, int reqtype,
 				 struct ipath_eeprom_req *req);
-
-/* sysfs helper routines (only those currently used are exported;
- * try to avoid using others) */
-
-/* base name of path (without unit #) for qib driver */
-#define QIB_CLASS_PATH "/sys/class/infiniband/qib"
-
-/* read a signed 64-bit quantity, in some arbitrary base */
-int ipath_sysfs_read_s64(const char *attr, int64_t *valp, int base);
-
-/* read a string value */
-int ipath_sysfs_port_read(uint32_t unit, uint32_t port, const char *attr,
-			  char **datap);
-
-/* open attribute in unit's sysfs directory via open(2) */
-int ipath_sysfs_unit_open(uint32_t unit, const char *attr, int flags);
-/* print to attribute in {unit,port} sysfs directory */
-int ipath_sysfs_port_printf(uint32_t unit, uint32_t port, const char *attr,
-			    const char *fmt, ...)
-  __attribute__((format(printf, 4, 5)));
-int ipath_sysfs_unit_printf(uint32_t unit, const char *attr,
-			    const char *fmt, ...)
-  __attribute__((format(printf, 3, 4)));
-
-int ipath_ipathfs_unit_write(uint32_t unit, const char *attr, const void *data,
-	size_t len);
-/* read up to one page of malloc'ed data (caller must free), returning
-   number of bytes read or -1 */
-int ipath_ipathfs_read(const char *attr, char **datap);
-int ipath_ipathfs_unit_read(uint32_t unit, const char *attr, char **data);
-/* read a signed 64-bit quantity, in some arbitrary base */
-int ipath_sysfs_unit_read_s64(uint32_t unit, const char *attr,
-			      int64_t *valp, int base);
-int ipath_sysfs_port_read_s64(uint32_t unit, uint32_t port, const char *attr,
-			      int64_t *valp, int base);
-/* these read directly into supplied buffer and take a count */
-int ipath_ipathfs_rd(const char *, void *, int);
-int ipath_ipathfs_unit_rd(uint32_t unit, const char *, void *, int);
-
-int ipath_ipathfs_open(const char *relname, int flags);
-
-/* wait for device special file to show up. timeout is in
-   milliseconds, 0 is "callee knows best", < 0 is infinite. */
-int ipath_wait_for_device(const char *path, long timeout);
 
 #endif				// _IPATH_USER_H

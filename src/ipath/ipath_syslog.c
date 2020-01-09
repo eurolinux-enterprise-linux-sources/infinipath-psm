@@ -1,4 +1,5 @@
 /*
+ * Copyright (c) 2013. Intel Corporation. All rights reserved.
  * Copyright (c) 2006-2012. QLogic Corporation. All rights reserved.
  * Copyright (c) 2003-2006, PathScale, Inc. All rights reserved.
  *
@@ -49,7 +50,6 @@ ipath_vsyslog(const char *prefix, int to_console, int level,
 	     const char *format, va_list ap)
 {
     char logprefix[SYSLOG_MAXLEN];
-    size_t len;
 
     if (to_console) {
 	char hostname[80];
@@ -68,9 +68,10 @@ ipath_vsyslog(const char *prefix, int to_console, int level,
 	if (format[len] != '\n')
 	    fprintf(stderr, "\n");
 	fflush(stderr);
+	va_end(ap_cons);
     }
 
-    len = snprintf(logprefix, sizeof(logprefix), 
+    (void)snprintf(logprefix, sizeof(logprefix), 
 	  "(ipath/%s)[%d]: %s", prefix ? prefix : "ipath", (int) getpid(),
 	  format);
 

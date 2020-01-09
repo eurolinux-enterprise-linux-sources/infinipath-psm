@@ -1,4 +1,5 @@
 /*
+ * Copyright (c) 2013. Intel Corporation. All rights reserved.
  * Copyright (c) 2006-2012. QLogic Corporation. All rights reserved.
  * Copyright (c) 2003-2006, PathScale, Inc. All rights reserved.
  *
@@ -86,7 +87,7 @@ ipath_sighdlr(int sig, siginfo_t *p1, void *ucv)
     static void *backaddr[128]; // avoid stack usage
     static char buf[150], hname[64], fname[128];
     static int i, j, fd, id;
-    static int write_result;
+    static int write_result __unused__;
     extern char *__progname;
 
     // If this is a SIGINT do not display backtrace. Just invoke exit handlers

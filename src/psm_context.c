@@ -1,4 +1,5 @@
 /*
+ * Copyright (c) 2013. Intel Corporation. All rights reserved.
  * Copyright (c) 2006-2012. QLogic Corporation. All rights reserved.
  * Copyright (c) 2003-2006, PathScale, Inc. All rights reserved.
  *
@@ -37,13 +38,17 @@
 
 #include "psm_user.h"
 
+#ifdef __MIC__
+#include <scif.h>
+#endif
+
 #define PSMI_SHARED_CONTEXTS_ENABLED_BY_DEFAULT   1
-static uint32_t psmi_get_num_contexts(int unit_id);
 static int	psmi_sharedcontext_params(int *nranks, int *rankid);
 static int      psmi_get_hca_selection_algorithm(void);
-static psm_error_t psmi_init_userinfo_params(int unit_id, int port,
-		    psm_uuid_t const unique_job_key,
-		    struct ipath_user_info *user_info);
+static psm_error_t psmi_init_userinfo_params(psm_ep_t ep, 
+		int unit_id, int port,
+		psm_uuid_t const unique_job_key,
+		struct ipath_user_info *user_info);
 
 psm_error_t
 psmi_context_interrupt_set(psmi_context_t *context, int enable)
@@ -156,41 +161,29 @@ psmi_context_open(const psm_ep_t ep, long unit_id, long port,
     char dev_name[MAXPATHLEN];
     psm_error_t err = PSM_OK;
     uint32_t driver_verno, hca_type;
-    extern volatile __u64 *__ipath_spi_status;
+    int retry_delay = 0;
 
     /*
      * If shared contexts are enabled, try our best to schedule processes
      * across one or many devices
      */
 
-    if (unit_id != PSMI_UNIT_ID_ANY && unit_id >= 0) 
-	snprintf(dev_name, sizeof(dev_name), "%s%u", "/dev/ipath", (int) unit_id);
-    else
-	snprintf(dev_name, sizeof(dev_name), "%s", "/dev/ipath");
-
     if (timeout_ns > 0)
 	open_timeout = (long)(timeout_ns/MSEC_ULL);
+    if (unit_id != IPATH_UNIT_ID_ANY && unit_id >= 0)
+        snprintf(dev_name, sizeof(dev_name), "%s%u", "/dev/ipath", (unsigned)unit_id);
+    else
+        snprintf(dev_name, sizeof(dev_name), "%s", "/dev/ipath");
 
-    context->fd = -1;
-    if (ipath_wait_for_device(dev_name, open_timeout) == -1) {
-	err = psmi_handle_error(NULL, PSM_EP_NO_DEVICE,
-		    "PSM Could not find an InfiniPath Unit on device "
-		    "%s (%lds elapsed)", dev_name, open_timeout / 1000);
-	goto bail;
-    }
-
-    if ((context->fd = open(dev_name, O_RDWR)) == -1) {
+    context->fd = ipath_context_open(unit_id, port, open_timeout);
+    if (context->fd == -1) {
 	err = psmi_handle_error(NULL, PSM_EP_DEVICE_FAILURE,
 		    "PSM can't open %s for reading and writing",
 		    dev_name);
 	goto bail;
     }
 
-    if(fcntl(context->fd, F_SETFD, FD_CLOEXEC))
-        _IPATH_INFO("Failed to set close on exec for device: %s\n",
-            strerror(errno));
-
-    if ((err = psmi_init_userinfo_params((int) unit_id, (int)port, job_key,
+    if ((err = psmi_init_userinfo_params(ep, (int) unit_id, (int)port, job_key,
 				&context->user_info))) 
 	goto bail;
 
@@ -207,7 +200,6 @@ retry_open:
 	goto fail;
       
       if ((open_timeout == -1L) || (errno == EBUSY) || (errno == ENODEV)) {
-	    static int retry_delay = 0;
 	    if(!retry_delay) {
 		_IPATH_PRDBG("retrying open: %s, network down\n", dev_name);
 		retry_delay = 1;
@@ -280,7 +272,8 @@ retry_open:
     /* We are overloading this runtime flags for PSM options so make sure
      * something can never go horribly bad */
     psmi_assert_always(context->runtime_flags < _PSMI_RUNTIME_LAST);
-    context->spi_status = (volatile uint64_t *) __ipath_spi_status;
+    context->spi_status = (volatile uint64_t *)
+			context->ctrl->__ipath_spi_status;
 
     {
 	char buf[192];
@@ -318,7 +311,7 @@ fail:
 bail:
     _IPATH_PRDBG("%s open failed: %d (%s)\n", dev_name, err, strerror(errno));
     if (context->fd != -1) {
-	(void) close(context->fd);
+	ipath_context_close(context->fd);
 	context->fd = -1;
     }
 ret: 
@@ -329,7 +322,7 @@ psm_error_t
 psmi_context_close(psmi_context_t *context)
 {
     if (context->fd >= 0) {
-	close(context->fd);
+	ipath_context_close(context->fd);
 	context->fd = -1;
     }
     return PSM_OK;
@@ -430,11 +423,14 @@ ret:
  */
 static
 psm_error_t
-psmi_init_userinfo_params(int unit_id, int port,
+psmi_init_userinfo_params(psm_ep_t ep, int unit_id, int port,
 		psm_uuid_t const unique_job_key,
 		struct ipath_user_info *user_info)
 {
-    int shcontexts_enabled, rankid, nranks;
+    /* static variables, shared among rails */
+    static int shcontexts_enabled = -1, rankid, nranks;
+    static int subcontext_id_start = -1;
+
     int avail_contexts = 0, max_contexts, ask_contexts, ranks_per_context = 0;
     uint32_t job_key;
     uint16_t *jkp;
@@ -447,12 +443,14 @@ psmi_init_userinfo_params(int unit_id, int port,
     user_info->spu_subcontext_cnt = 0;
     user_info->spu_port_alg = psmi_get_hca_selection_algorithm();
 
-    shcontexts_enabled = psmi_sharedcontext_params(&nranks, &rankid);
+    if (shcontexts_enabled == -1) {
+        shcontexts_enabled = psmi_sharedcontext_params(&nranks, &rankid);
+    }
 
     if (!shcontexts_enabled)
 	return err;
 
-    avail_contexts = psmi_get_num_contexts(unit_id);
+    avail_contexts = ipath_get_num_contexts(unit_id);
     jkp = (uint16_t *) unique_job_key;
 
     /* Use a unique subcontext id based on uuid.  This is just to optimistically
@@ -460,7 +458,10 @@ psmi_init_userinfo_params(int unit_id, int port,
      * same time */
     job_key =  ((jkp[2] ^ jkp[3]) >> 8) | ((jkp[0] ^ jkp[1]) << 8);
     job_key ^= ((jkp[6] ^ jkp[7]) >> 8) | ((jkp[4] ^ jkp[5]) << 8);
-    job_key &= ~0xff; /* just to make more readable */
+    /* comment out, because it has more chance to generate the same job_key for
+     * two unrelated jobs that would start at the same time, and causes context
+     * allocation failure */
+    //job_key &= ~0xff; /* just to make more readable */
 
     if (avail_contexts == 0) {
 	err = psmi_handle_error(NULL, PSM_EP_NO_DEVICE,
@@ -494,7 +495,7 @@ psmi_init_userinfo_params(int unit_id, int port,
      * shm segment to obtain a unique shmidx.
      */
     if (rankid == -1) {
-	if ((err = psmi_shm_attach(unique_job_key, &rankid)))
+	if ((err = psmi_shm_attach(ep, &rankid)))
 	    goto fail;
     }
 
@@ -523,17 +524,46 @@ psmi_init_userinfo_params(int unit_id, int port,
         int contexts = (nranks + ranks_per_context - 1) / ranks_per_context;
 	if (contexts > ask_contexts) {
 	    err = psmi_handle_error(NULL, PSM_EP_NO_DEVICE,
-		    "Incompatible settings for "
-		    "PSM_SHAREDCONTEXTS_MAX and PSM_RANKS_PER_CONTEXT");
+		    "Context required %d (nranks %d, ranks_per_context %d) "
+		    "is less than allowed context %d which is either the "
+		    "total avail_context %d or set by PSM_SHAREDCONTEXTS_MAX\n",
+		    contexts, nranks, ranks_per_context, ask_contexts, avail_contexts);
 	    goto fail;
 	}
 	ask_contexts = contexts;
     }
 
     user_info->spu_port = port; /* requested IB port if > 0 */
+    if (subcontext_id_start == -1) {
+#ifdef __MIC__
+	/* this query is moved from ipath_userinit() to here,
+	 * it is also used there by ipath_cmd_assign_context() call. */
+	if (scif_get_nodeIDs(NULL, 0, (uint16_t*)&user_info->_spu_scif_nodeid) < 0) {
+	    _IPATH_INFO("scif_get_nodeIDs() call failed: %s\n", strerror(errno));
+	    goto fail;
+	}
+	/*
+ 	 * When processes from different MICs to use the same HCA, and
+ 	 * context sharing is enabled, we can't mix them, only processes
+ 	 * from the same MIC node can share a context, so we need to
+ 	 * generate a unique id. Here we use the queried nodeID to do it,
+ 	 * avail_contexts is a constant for all MICs.
+ 	 */
+	subcontext_id_start = avail_contexts * user_info->_spu_scif_nodeid;
+#else
+	subcontext_id_start = 0;
+#endif
+    }
 
     /* "unique" id based on job key */
-    user_info->spu_subcontext_id = job_key + rankid % ask_contexts;
+    user_info->spu_subcontext_id = subcontext_id_start +
+			job_key + rankid % ask_contexts;
+    /* this is for multi-rail, when we setup a new rail,
+     * we can not use the same subcontext ID as the previous
+     * rail, otherwise, the driver will match previous rail
+     * and fail.
+     */
+    subcontext_id_start += ask_contexts;
 
     /* Need to compute with how many *other* peers we will be sharing the
      * context */
@@ -561,39 +591,6 @@ psmi_init_userinfo_params(int unit_id, int port,
 		 (int) user_info->spu_port);
 fail:
     return err;
-}
-
-static
-uint32_t
-psmi_get_num_contexts(int unit_id)
-{
-    uint32_t units;
-    uint32_t n = 0;
-
-    if (psm_ep_num_devunits(&units) == PSM_OK) {
-	int64_t val;
-	if (unit_id == PSMI_UNIT_ID_ANY) {
-	  uint32_t u, p;
-	    for (u = 0; u < units; u++) {
-	        for (p = 1; p <= IPATH_MAX_PORT; p++)
-		    if (ipath_get_port_lid(u, p) != -1)
-		        break;
-		if (p <= IPATH_MAX_PORT &&
-		    !ipath_sysfs_unit_read_s64(u, "nctxts", &val, 0))
-		    n += (uint32_t) val;
-	    }
-	}
-	else {
-	    uint32_t p;
-	    for (p = 1; p <= IPATH_MAX_PORT; p++)
-		if (ipath_get_port_lid(unit_id, p) != -1)
-	            break;
-	    if (p <= IPATH_MAX_PORT &&
-		!ipath_sysfs_unit_read_s64(unit_id, "nctxts", &val, 0))
-	        n += (uint32_t) val;
-	}
-    }
-    return n;
 }
 
 static

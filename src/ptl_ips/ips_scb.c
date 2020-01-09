@@ -1,4 +1,5 @@
 /*
+ * Copyright (c) 2013. Intel Corporation. All rights reserved.
  * Copyright (c) 2006-2012. QLogic Corporation. All rights reserved.
  * Copyright (c) 2003-2006, PathScale, Inc. All rights reserved.
  *
@@ -46,8 +47,10 @@ ips_scbctrl_init(const psmi_context_t *context,
     int i;
     struct ips_scb *scb;
     size_t scb_size;
+    size_t alloc_sz;
+    uintptr_t base, imm_base;
     psm_ep_t ep = context->ep;
-    scbc->context = context;
+    //scbc->context = context;
     psm_error_t err = PSM_OK;
 
     psmi_assert_always(numscb > 0);
@@ -62,8 +65,6 @@ ips_scbctrl_init(const psmi_context_t *context,
      * are on a page boundary */
     if (numbufs > 0) {
 	struct ips_scbbuf *sbuf;
-	uintptr_t base;
-	size_t alloc_sz;
 	int redzone = PSM_VALGRIND_REDZONE_SZ;
 
 	/* If the allocation requested is a page and we have redzones we have
@@ -75,6 +76,7 @@ ips_scbctrl_init(const psmi_context_t *context,
 	if (redzone > 0 && bufsize % PSMI_PAGESIZE == 0)
 	    redzone = PSMI_PAGESIZE / 2;
 	bufsize += 2 * redzone;
+	bufsize = PSMI_ALIGNUP(bufsize, 64);
 
 	alloc_sz = numbufs * bufsize + redzone + PSMI_PAGESIZE; 
 	scbc->sbuf_buf_alloc = 
@@ -83,15 +85,16 @@ ips_scbctrl_init(const psmi_context_t *context,
 	    err = PSM_NO_MEMORY;
 	    goto fail;
 	}
-	base = PSMI_ALIGNUP(scbc->sbuf_buf_alloc, PSMI_PAGESIZE) - redzone;
-	scbc->sbuf_buf_base = (void *) base + redzone;
-	scbc->sbuf_buf_last = (void *) (base + bufsize * (numbufs-1) + redzone);
+	base = (uintptr_t)scbc->sbuf_buf_alloc;
+	base = PSMI_ALIGNUP(base + redzone, PSMI_PAGESIZE);
+	scbc->sbuf_buf_base = (void *)base;
+	scbc->sbuf_buf_last = (void *)(base + bufsize * (numbufs-1));
 	_IPATH_VDBG("sendbufs=%d, (redzone=%d|size=%d|redzone=%d),base=[%p..%p)\n", 
 		    numbufs, redzone, bufsize-2*redzone, redzone,  
 		    (void *) scbc->sbuf_buf_base, (void *) scbc->sbuf_buf_last);
 
 	for (i = 0; i < numbufs; i++) {
-	    sbuf = (struct ips_scbbuf *) (base + bufsize * i + redzone);
+	    sbuf = (struct ips_scbbuf *) (base + bufsize * i);
 	    SLIST_NEXT(sbuf, next) = NULL;
 	    SLIST_INSERT_HEAD(&scbc->sbuf_free, sbuf, next);
 	}
@@ -103,14 +106,18 @@ ips_scbctrl_init(const psmi_context_t *context,
 			      PSM_VALGRIND_MEM_DEFINED);
     }
     
+    imm_base = 0;
     scbc->scb_imm_size = imm_size;
     if (scbc->scb_imm_size) {
+      scbc->scb_imm_size = PSMI_ALIGNUP(imm_size, 64);
+      alloc_sz = numscb * scbc->scb_imm_size + 64;
       scbc->scb_imm_buf = 
-	psmi_calloc(ep, NETWORK_BUFFERS, numscb, scbc->scb_imm_size);
+	psmi_calloc(ep, NETWORK_BUFFERS, 1, alloc_sz);
       if (scbc->scb_imm_buf == NULL) {
 	err = PSM_NO_MEMORY;
 	goto fail;
       }
+      imm_base = PSMI_ALIGNUP(scbc->scb_imm_buf, 64);
     }
     else
       scbc->scb_imm_buf = NULL;
@@ -118,20 +125,21 @@ ips_scbctrl_init(const psmi_context_t *context,
     scbc->scb_num = scbc->scb_num_cur = numscb;
     SLIST_INIT(&scbc->scb_free);
     scb_size = sizeof(struct ips_scb) + 2*PSM_VALGRIND_REDZONE_SZ;
-    scb = (struct ips_scb *) 
-	psmi_calloc(ep, NETWORK_BUFFERS, numscb, scb_size);
-    if (scb == NULL) {
+    scb_size = PSMI_ALIGNUP(scb_size, 64);
+    alloc_sz = numscb * scb_size + PSM_VALGRIND_REDZONE_SZ + 64;
+    scbc->scb_base = (void *)
+	psmi_calloc(ep, NETWORK_BUFFERS, 1, alloc_sz);
+    if (scbc->scb_base == NULL) {
 	err = PSM_NO_MEMORY;
 	goto fail;
     }
-    scbc->scb_base = (void *) scb;
+    base = (uintptr_t)scbc->scb_base;
+    base = PSMI_ALIGNUP(base + PSM_VALGRIND_REDZONE_SZ, 64);
     for (i = 0; i < numscb; i++) {
-	scb = (struct ips_scb *)
-		((uintptr_t) scbc->scb_base + i * scb_size + PSM_VALGRIND_REDZONE_SZ);
+	scb = (struct ips_scb *)(base + i * scb_size);
 	scb->scbc = scbc;
 	if (scbc->scb_imm_buf)
-	  scb->imm_payload = 
-	    (void*) ((uintptr_t) scbc->scb_imm_buf + (i * scbc->scb_imm_size));
+	  scb->imm_payload = (void*)(imm_base + (i * scbc->scb_imm_size));
 	else
 	  scb->imm_payload = NULL;
 	
@@ -236,6 +244,8 @@ ips_scbctrl_alloc(struct ips_scbctrl *scbc, int scbnum, int len, uint32_t flags)
 	scb->callback = NULL;
         scb->ips_lrh.mqhdr = 0;
         scb->offset = 0;
+        scb->nfrag = 1;
+	scb->frag_size = 0;
 	
 	scbc->scb_num_cur--;
 	if (scbc->scb_num_cur < (scbc->scb_num >> 1))
@@ -293,6 +303,8 @@ ips_scbctrl_alloc_tiny(struct ips_scbctrl *scbc)
     scb->tid = IPATH_EAGER_TID_ID;
     scb->tidsendc = NULL;
     scb->callback = NULL;
+    scb->nfrag = 1;
+    scb->frag_size = 0;
     
     scbc->scb_num_cur--;
     if (scbc->scb_num_cur < (scbc->scb_num >> 1))

@@ -1,0 +1,51 @@
+commit dfaace420c1f3fdd646630122c5ae601aef6e4a0
+Author: John Fleck <john.fleck@intel.com>
+Date:   Fri Apr 4 10:54:25 2014 -0400
+
+    Add make install action.
+    
+    INTERNAL: PR 124157 - hfi-psm has errors on make install
+    
+    Change-Id: I4ae51dd3a06d7150c3d422fe72886d89eb1d2ce0
+
+diff --git a/libuuid/Makefile b/libuuid/Makefile
+index fb62602..71fa643 100644
+--- a/libuuid/Makefile
++++ b/libuuid/Makefile
+@@ -44,3 +44,6 @@ all: ${${TARGLIB}-objs}
+ 
+ clean:
+ 	rm -f *.o
++
++install:
++	@echo "Nothing to do for install."
+diff --git a/ptl_am/Makefile b/ptl_am/Makefile
+index 292feaf..95faf09 100644
+--- a/ptl_am/Makefile
++++ b/ptl_am/Makefile
+@@ -44,3 +44,5 @@ all: ${${TARGLIB}-objs}
+ clean:
+ 	rm -f *.o
+ 
++install:
++	@echo "Nothing to do for install."
+diff --git a/ptl_ips/Makefile b/ptl_ips/Makefile
+index fcd5313..1b845f4 100644
+--- a/ptl_ips/Makefile
++++ b/ptl_ips/Makefile
+@@ -54,3 +54,5 @@ all: ${${TARGLIB}-objs}
+ clean:
+ 	rm -f *.o
+ 
++install:
++	@echo "Nothing to do for install."
+diff --git a/ptl_self/Makefile b/ptl_self/Makefile
+index 9e6826d..7b16674 100644
+--- a/ptl_self/Makefile
++++ b/ptl_self/Makefile
+@@ -44,3 +44,5 @@ all: ${${TARGLIB}-objs}
+ clean:
+ 	rm -f *.o
+ 
++install:
++	@echo "Nothing to do for install."

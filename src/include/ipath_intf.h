@@ -1,4 +1,5 @@
 /*
+ * Copyright (c) 2013. Intel Corporation. All rights reserved.
  * Copyright (c) 2006-2012. QLogic Corporation. All rights reserved.
  * Copyright (c) 2003-2006, PathScale, Inc. All rights reserved.
  *
@@ -41,7 +42,11 @@
 #ifdef __inline__
 #undef __inline__
 #endif
-#define __inline__ __attribute__((always_inline,unused))
+#define __inline__ inline __attribute__((always_inline,unused))
+#ifdef __unused__
+#undef __unused__
+#endif
+#define __unused__ __attribute__((unused))
 
 #include "sysdep.h"
 #include "bit_ops.h"

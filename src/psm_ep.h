@@ -1,4 +1,5 @@
 /*
+ * Copyright (c) 2013. Intel Corporation. All rights reserved.
  * Copyright (c) 2006-2012. QLogic Corporation. All rights reserved.
  * Copyright (c) 2003-2006, PathScale, Inc. All rights reserved.
  *
@@ -38,6 +39,10 @@
 #ifndef _PSMI_EP_H
 #define _PSMI_EP_H
 
+#ifdef PSM_HAVE_SCIF
+#include <scif.h>
+#endif
+
 /* 
  * EPIDs encode the following information:
  * 
@@ -45,7 +50,7 @@
  * SUBCONTEXT:2 bits - Subcontext used for endpoint
  * CONTEXT:6 bits - Context used for bits (upto 64 contexts)
  * IBA_SL: 4 bits - Default SL to use for endpoint
- * HCATYPE: 3 bits - QLE71XX, QLE72XX, QLE73XX ....
+ * HCATYPE: 4 bits - QLE71XX, QLE72XX, QLE73XX ....
  */
 
 #define PSMI_HCA_TYPE_UNKNOWN 0
@@ -62,23 +67,16 @@
     ((((uint64_t)subcontext)&0x3)<<14) |		       \
     ((((uint64_t)context)&0x3f)<<8) |			       \
     ((((uint64_t)sl)&0xf)<<4) |				       \
-    (((uint64_t)hca_type)&0x7) )
-
-#define PSMI_EPID_UNPACK_EXT(epid,lid,context,subcontext,hca_type,sl) do { \
-    (lid) = ((epid)>>16)&0xffff;					\
-    (subcontext) = ((epid)>>14)&0x3;					\
-    (context) = ((epid)>>8)&0x3f;					\
-    (sl) = ((epid)>>4)&0xf;						\
-    (hca_type) = ((epid)&0x7);						\
-  } while (0)
+    (((uint64_t)hca_type)&0xf) )
 
 #define PSMI_EPID_PACK(lid,context,subcontext)	\
   PSMI_EPID_PACK_EXT(lid,context,subcontext,PSMI_HCA_TYPE_DEFAULT, PSMI_SL_DEFAULT)
 
-#define PSMI_EPID_UNPACK(epid,lid,context,subcontext) do {	\
-    uint32_t hca_type, sl;					\
-    PSMI_EPID_UNPACK_EXT(epid,lid,context,subcontext,hca_type,sl);	\
-  } while (0)
+#define PSMI_EPID_GET_LID(epid)         (((epid)>>16)&0xffff)
+#define PSMI_EPID_GET_SUBCONTEXT(epid)  (((epid)>>14)&0x3)
+#define PSMI_EPID_GET_CONTEXT(epid)     (((epid)>>8)&0x3f)
+#define PSMI_EPID_GET_SL(epid)          (((epid)>>4)&0xf)
+#define PSMI_EPID_GET_HCATYPE(epid)     (((epid)>>0)&0xf)
 
 #define PSMI_MIN_EP_CONNECT_TIMEOUT (2 * SEC_ULL)
 #define PSMI_MIN_EP_CLOSE_TIMEOUT   (2 * SEC_ULL)
@@ -104,6 +102,15 @@ struct psm_ep {
     int			devid_enabled[PTL_MAX_INIT];
     int			memmode;    /**> min, normal, large memory mode */
 
+#ifdef PSM_HAVE_SCIF
+    scif_epd_t		scif_epd;    /* scif listen endpoint */
+    int                 scif_dma_threshold; /* DMA message size threshold */
+    int			scif_mynodeid; /* my scif node ID */
+    int			scif_nnodes; /* Number of scif nodes on system */
+    int                 scif_dma_mode;
+    pthread_t           scif_thread; /* Thread listening for SCIF connects */
+#endif
+
     uint32_t	ipath_num_sendbufs; /**> Number of allocated send buffers */
     uint32_t    ipath_num_descriptors; /** Number of allocated scb descriptors*/
     uint32_t    ipath_imm_size;     /** Immediate data size */
@@ -114,8 +121,28 @@ struct psm_ep {
     char	*context_mylabel;
     uint32_t	yield_spin_cnt;
 
+    /* EP link-lists */
+    struct psm_ep	*user_ep_next;
+
+    /* EP link-lists for multi-context. */
+    struct psm_ep	*mctxt_prev;
+    struct psm_ep	*mctxt_next;
+    struct psm_ep	*mctxt_master;
+
     /* Active Message handler table */
-    void    **am_htable;
+    void	**am_htable;
+    int		psmi_kassist_fd; /* when using kassist */
+    int		psmi_kassist_mode;
+
+    struct amsh_qdirectory      *amsh_qdir;
+    uintptr_t   amsh_shmbase;  /* base for mmap */
+    uintptr_t   amsh_blockbase; /* base for block 0 (after ctl dirpage) */
+    struct am_ctl_dirpage *amsh_dirpage;
+    psm_uuid_t  amsh_keyno;        /* context key uuid */
+    char        *amsh_keyname;/* context keyname */
+    int         amsh_shmfd;    /* context shared mmap fd */
+    int         amsh_shmidx;   /* last used shmidx */
+    int         amsh_max_idx;  /* max directory idx seen so far */
 
     uint64_t    gid_hi;
     uint64_t    gid_lo;
@@ -128,7 +155,15 @@ struct psm_ep {
     uint8_t ptl_base_data[0] __attribute__((aligned(8)));
 };
 
-#define PSMI_EGRLONG_FLOWS_MAX	4   /* must be same as EP_FLOW_LAST */
+struct mqq {
+    psm_mq_req_t    first;
+    psm_mq_req_t    *lastp;
+};
+
+struct mqsq {
+    psm_mq_req_t    first;
+    psm_mq_req_t    *lastp;
+};
 
 typedef
 union psmi_egrid {
@@ -140,8 +175,6 @@ union psmi_egrid {
 }
 psmi_egrid_t;
 
-#define PSMI_EGRID_NULL	{ .egr_flowid = 0, .egr_msgno = 0 }
-
 typedef 
 union psmi_seqnum {
   struct {
@@ -150,8 +183,11 @@ union psmi_seqnum {
     uint32_t flow:5;
   };
   struct {
+    uint32_t pkt:16;
+    uint32_t msg:8;
+  };
+  struct {
     uint32_t psn:24;
-    uint32_t pad:8;
   };
   uint32_t val;
 } psmi_seqnum_t;
@@ -164,8 +200,9 @@ struct psm_epaddr {
   
     void           *usr_ep_ctxt;   /* User context associated with endpoint */
 
-    STAILQ_HEAD(, psm_mq_req)	egrlong[PSMI_EGRLONG_FLOWS_MAX];
-    //psm_mq_req_t    next_egrlong[PSMI_EGRLONG_FLOWS_MAX];
+    STAILQ_HEAD(, psm_mq_req) egrlong; /**> egrlong request queue */
+    STAILQ_HEAD(, psm_mq_req) egrdata; /**> egrlong data queue */
+    psmi_egrid_t	xmit_egrlong;
 
     /* PTLs have a few ways to initialize the ptl address */
     union {
@@ -174,7 +211,35 @@ struct psm_epaddr {
 	uint64_t	 _ptladdr_u64;
 	uint8_t		 _ptladdr_data[0];
     };
+
+    /* it makes sense only in master */
+    uint64_t		mctxt_gidhi[IPATH_MAX_UNIT];
+    psm_epid_t		mctxt_epid[IPATH_MAX_UNIT];
+    int			mctxt_epcount;
+    int			mctxt_nsconn;	/* # slave connection */
+    uint16_t		mctxt_send_seqnum;
+    uint16_t		mctxt_recv_seqnum;
+    struct psm_epaddr	*mctxt_current;
+    struct mqsq		outoforder_q; /**> OutofOrder queue */
+    int			outoforder_c; /* OOO queue count */
+
+    /* epaddr linklist for multi-context. */
+    struct psm_epaddr	*mctxt_master;
+    struct psm_epaddr	*mctxt_prev;
+    struct psm_epaddr	*mctxt_next;
 };
+
+#define PSM_MCTXT_APPEND(head, node)	\
+	node->mctxt_prev = head->mctxt_prev; \
+	node->mctxt_next = head; \
+	head->mctxt_prev->mctxt_next = node; \
+	head->mctxt_prev = node; \
+	node->mctxt_master = head
+#define PSM_MCTXT_REMOVE(node)	\
+	node->mctxt_prev->mctxt_next = node->mctxt_next; \
+	node->mctxt_next->mctxt_prev = node->mctxt_prev; \
+	node->mctxt_next = node->mctxt_prev = node; \
+	node->mctxt_master = NULL
 
 #ifndef PSMI_BLOCKUNTIL_POLLS_BEFORE_YIELD
 #  define PSMI_BLOCKUNTIL_POLLS_BEFORE_YIELD  250

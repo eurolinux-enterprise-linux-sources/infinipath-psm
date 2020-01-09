@@ -1,21 +1,21 @@
 # infinipath-psm-2.9
 Summary: QLogic PSM Libraries
 Name: infinipath-psm
-Version: 3.0.1
-Release: 115.1015_open.2%{?dist}
+Version: 3.3
+Release: 0.4.git6f42cdb_open%{?dist}
 License: BSD or GPLv2
 ExclusiveArch: x86_64
 Group: System Environment/Libraries
-URL: git://git.qlogic.com/InfiniPath-PSM
-Source0: %{name}-%{version}-115.1015_open.tar.gz
+#URL: git://git.qlogic.com/InfiniPath-PSM
+Source: https://www.openfabrics.org/downloads/infinipath-psm/%{name}-%{version}-2_g6f42cdb_open.tar.gz
 Source1: ipath.rules
 Patch0: infinipath-psm-1.13-execstack.patch
-Patch1: infinipath-psm-correct-knem-build.patch
 Prefix: /usr
 BuildRoot: %{_tmppath}/%{name}-%{version}-%{release}-root
 Requires(post): /sbin/ldconfig
 Requires(postun): /sbin/ldconfig
 Requires: libuuid >= 2.17.2-12.7.el6
+BuildRequires: libuuid-devel >= 2.17.2-12.7.el6, valgrind-devel
 Conflicts: infinipath-libs
 
 %package devel
@@ -38,12 +38,11 @@ interfaces in parallel environments.
 Development files for the libpsm_infinipath library
 
 %prep
-%setup -q -n %{name}-%{version}-115.1015_open
-%patch0 -p1 -b .execstack
-%patch1 -p1 -b .build
+%setup -q -n %{name}-%{version}-2_g6f42cdb_open
+%patch0 -p1 -b .noexec
 
 %build
-%{__make} 
+%{__make} CFLAGS="$RPM_OPT_FLAGS -fpic -fPIC -D_GNU_SOURCE -funwind-tables -O3 -g3 -DPSM_USE_SYS_UUID -DNVALGRIND -Wno-error=format-security" LDFLAGS="$RPM_LD_FLAGS"
 
 %install
 rm -rf $RPM_BUILD_ROOT
@@ -76,6 +75,22 @@ rm -rf $RPM_BUILD_ROOT
 
 
 %changelog
+* Thu Mar 12 2015 Doug Ledford <dledford@redhat.com> - 3.3-0.4.git6f42cdb_open
+- Found the noexec stack issue, had to revive an old patch
+- Related: bz1138643
+
+* Thu Mar 12 2015 Doug Ledford <dledford@redhat.com> - 3.3-0.3.git6f42cdb_open
+- Another stab at fixing up the security options
+- Related: bz1138643
+
+* Thu Mar 12 2015 Doug Ledford <dledford@redhat.com> - 3.3-0.2.git6f42cdb_open
+- Fix the build so that security options are honored (found by rpmdiff)
+- Related: bz1138643
+
+* Wed Mar 11 2015 Doug Ledford <dledford@redhat.com> - 3.3-0.1.git6f42cdb_open
+- Update to latest upstream
+- Resolves: bz1138643
+
 * Thu Jan 24 2013 Jay Fenlason <fenlason@redhat.com>
 - Put the udev rules file in the right place
   Resolves: rhbz866732

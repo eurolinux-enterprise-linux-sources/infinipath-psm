@@ -1,0 +1,25 @@
+--- Makefile
++++ Makefile
+@@ -44,3 +44,6 @@
+ 
+ clean:
+ 	rm -f *.o
++
++install:
++	@echo "Nothing to do for install."
+--- Makefile
++++ Makefile
+@@ -54,3 +54,5 @@
+ clean:
+ 	rm -f *.o
+ 
++install:
++	@echo "Nothing to do for install."
+--- Makefile
++++ Makefile
+@@ -44,3 +44,5 @@
+ clean:
+ 	rm -f *.o
+ 
++install:
++	@echo "Nothing to do for install."

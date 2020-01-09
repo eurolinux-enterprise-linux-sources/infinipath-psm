@@ -1,4 +1,5 @@
 /*
+ * Copyright (c) 2013. Intel Corporation. All rights reserved.
  * Copyright (c) 2006-2012. QLogic Corporation. All rights reserved.
  * Copyright (c) 2003-2006, PathScale, Inc. All rights reserved.
  *
@@ -145,7 +146,12 @@ ips_spio_init(const struct psmi_context *context, const struct ptl *ptl,
     else {
 	switch ( wc_unordered ) {
 	    case 0: 
+#ifdef __MIC__
+		ctrl->spio_copy_fn = getenv("IPATH_MIC_DWORD_PIO")?
+				ipath_write_pio:ipath_write_pio_vector;
+#else
 		ctrl->spio_copy_fn = ipath_write_pio;
+#endif
 		order_str = "natural CPU";
 		break;
 
@@ -177,7 +183,7 @@ spio_report_stall(struct ips_spio *ctrl, uint64_t t_cyc_now,
 {
     int last, i;
     size_t off = 0;
-    char buf[512];
+    char buf[1024];
     
     if (ctrl->spio_num_stall == 0)
 	return;
@@ -189,7 +195,7 @@ spio_report_stall(struct ips_spio *ctrl, uint64_t t_cyc_now,
 	uint64_t tx_stat, rx_stat;
 	int ret;
 
-	off = snprintf(buf, sizeof buf - off, 
+	off = snprintf(buf, sizeof buf - 1, 
 	    "PIO Send Bufs context %d with %d bufs from %d to %d. PIO avail regs: ",
 	    (int) psm_epid_context(ctrl->context->epid),
 	    ctrl->spio_num_of_buffer, ctrl->spio_first_buffer, 
@@ -197,12 +203,12 @@ spio_report_stall(struct ips_spio *ctrl, uint64_t t_cyc_now,
 
 	for (i = 0; i < 8; i++) {
 	    uint64_t avail = ips_spio_read_avail_index(ctrl, i);
-	    off += snprintf(buf+off, sizeof buf - off, " <%d>=(%llx) ", 
+	    off += snprintf(buf+off, sizeof buf - off - 1, " <%d>=(%llx) ", 
 		    i, (long long) avail);
 	}
-	off += snprintf(buf+off, sizeof buf - off, ". PIO shadow regs: ");
+	off += snprintf(buf+off, sizeof buf - off - 1, ". PIO shadow regs: ");
 	for (i = ctrl->spio_first_buffer/32; i <= last; i++) {
-	    off += snprintf(buf+off, sizeof buf - off, " <%d>=(%llx) ", 
+	    off += snprintf(buf+off, sizeof buf - off - 1, " <%d>=(%llx) ", 
 		    i, (long long)ctrl->spio_avail_shadow[i]);
 	}
 	buf[off] = '\0';
@@ -322,12 +328,12 @@ spio_update_shadow(struct ips_spio *ctrl, int index)
 	 * is not supported in the current implementation and in general is
 	 * bad for the SM to re-assign LIDs during a run.
 	 */
-	int lid, olid, context, subcontext;
+	int lid, olid;
 	
 	lid = 
 	  ipath_get_port_lid(proto->ep->context.base_info.spi_unit,
 			     proto->ep->context.base_info.spi_port);
-	PSMI_EPID_UNPACK(ctrl->context->epid, olid, context, subcontext);
+	olid = PSMI_EPID_GET_LID(ctrl->context->epid);
 	
 	_IPATH_INFO("Warning! LID change detected during run. Old LID: %x, New Lid: %x\n", olid, lid);
       }
@@ -342,6 +348,7 @@ spio_update_shadow(struct ips_spio *ctrl, int index)
       }
     }
 
+    index &= 0x7;	// max spio_avail_shadow[] index.
     avail = ips_spio_read_avail_index(ctrl, index);
  
     do {
