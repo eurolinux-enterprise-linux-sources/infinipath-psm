@@ -33,7 +33,7 @@
 Summary: Intel PSM Libraries
 Name: infinipath-psm
 Version: 3.3
-Release: 7_g05f6f14_open
+Release: 19_g67c0807_open
 Epoch: 4
 License: GPL
 Group: System Environment/Libraries

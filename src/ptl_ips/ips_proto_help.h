@@ -79,7 +79,7 @@ ips_flow_gen_ackflags(ips_scb_t *scb, struct ips_flow *flow))
 PSMI_ALWAYS_INLINE(
 ptl_epaddr_flow_t ips_proto_flowid(struct ips_message_header *p_hdr))
 {
-  ptl_epaddr_flow_t flowidx = IPS_FLOWID_GET_INDEX(p_hdr->flowid);
+  ptl_epaddr_flow_t flowidx = IPS_FLOWID2INDEX(p_hdr->flowid);
   psmi_assert(flowidx < EP_FLOW_LAST);
   return flowidx;
 }
@@ -316,8 +316,7 @@ void ips_proto_hdr(ips_scb_t *scb,
 		(scb->offset >> 2)); // convert from byte to word offset
 
 	p_hdr->lrh[2] = __cpu_to_be16(paywords + SIZE_OF_CRC);
-	p_hdr->iph.pkt_flags |= __cpu_to_le16(
-    (kpf_flags & INFINIPATH_KPF_INTR_HDRSUPP_MASK));
+	p_hdr->iph.pkt_flags = __cpu_to_le16(kpf_flags);
 
 	ips_kdeth_cksum(p_hdr); // Generate KDETH checksum
 
@@ -350,9 +349,7 @@ void ips_proto_hdr(ips_scb_t *scb,
         (epr->epr_pkt_context << INFINIPATH_I_CONTEXT_SHIFT) +
         (scb->tid << INFINIPATH_I_TID_SHIFT) +
         (scb->offset >> 2)); // convert from byte to word offset
-    p_hdr->iph.pkt_flags = __cpu_to_le16(
-      kpf_flags | ((epr->epr_commidx_to >> IPS_EPSTATE_COMMIDX_SHIFT) &
-      IPS_EPSTATE_COMMIDX_MASK));
+    p_hdr->iph.pkt_flags = __cpu_to_le16(kpf_flags);
     
     ips_kdeth_cksum(p_hdr); // Generate KDETH checksum
 
@@ -387,7 +384,7 @@ ips_scb_prepare_flow_inner(ips_scb_t *scb,
 {
     uint32_t extra_bytes;
     uint32_t tot_paywords;
-    uint16_t pkt_flags = 0;
+    uint16_t pkt_flags = IPS_EPSTATE_COMMIDX_PACK(epr->epr_commidx_to);
     
     extra_bytes = scb->payload_size & 3;
     if (extra_bytes) {
