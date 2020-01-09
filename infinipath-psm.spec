@@ -2,14 +2,14 @@
 Summary: QLogic PSM Libraries
 Name: infinipath-psm
 Version: 3.3
-Release: 0.4.git6f42cdb_open%{?dist}
+Release: 1.7.git05f6f14_open%{?dist}
 License: BSD or GPLv2
 ExclusiveArch: x86_64
 Group: System Environment/Libraries
-#URL: git://git.qlogic.com/InfiniPath-PSM
-Source: https://www.openfabrics.org/downloads/infinipath-psm/%{name}-%{version}-2_g6f42cdb_open.tar.gz
+URL: https://github.com/01org/psm
+Source: https://www.openfabrics.org/downloads/infinipath-psm/%{name}-%{version}-7_g05f6f14_open.tar.gz
 Source1: ipath.rules
-Patch0: infinipath-psm-1.13-execstack.patch
+Patch0001: 0001-Fix-executable-stack-reported-by-readelf-l.patch
 Prefix: /usr
 BuildRoot: %{_tmppath}/%{name}-%{version}-%{release}-root
 Requires(post): /sbin/ldconfig
@@ -38,8 +38,8 @@ interfaces in parallel environments.
 Development files for the libpsm_infinipath library
 
 %prep
-%setup -q -n %{name}-%{version}-2_g6f42cdb_open
-%patch0 -p1 -b .noexec
+%setup -q -n %{name}-%{version}-7_g05f6f14_open
+%patch0001 -p1 -b .noexec
 
 %build
 %{__make} CFLAGS="$RPM_OPT_FLAGS -fpic -fPIC -D_GNU_SOURCE -funwind-tables -O3 -g3 -DPSM_USE_SYS_UUID -DNVALGRIND -Wno-error=format-security" LDFLAGS="$RPM_LD_FLAGS"
@@ -75,6 +75,11 @@ rm -rf $RPM_BUILD_ROOT
 
 
 %changelog
+* Mon Jan 18 2016 Michal Schmidt <mschmidt@redhat.com> - 3.3-1.7.git05f6f14_open
+- Update to latest upstream tarball
+- Replace no-exec-stack patch with one cherry-picked from upstream.
+- Resolves: bz1247994
+
 * Thu Mar 12 2015 Doug Ledford <dledford@redhat.com> - 3.3-0.4.git6f42cdb_open
 - Found the noexec stack issue, had to revive an old patch
 - Related: bz1138643

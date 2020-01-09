@@ -33,7 +33,7 @@
 Summary: Intel PSM Libraries
 Name: infinipath-psm
 Version: 3.3
-Release: 2_g6f42cdb_open
+Release: 7_g05f6f14_open
 Epoch: 4
 License: GPL
 Group: System Environment/Libraries
@@ -42,8 +42,11 @@ Source0: %{name}-%{version}-%{release}.tar.gz
 Prefix: /usr
 BuildRoot: %{_tmppath}/%{name}-%{version}-%{release}-root
 Provides: infinipath-psm = %{version}
+%if "%{PSM_HAVE_SCIF}" == "1"
+Provides: intel-mic-psm = %{version}
+%endif
 # MIC package
-Conflicts: intel-mic-psm
+Obsoletes: intel-mic-psm
 # OFED package
 Obsoletes: infinipath-libs <= %{version}-%{release}
 Conflicts: infinipath-libs <= %{version}-%{release}
@@ -58,41 +61,11 @@ Summary: Development files for Intel PSM
 Group: System Environment/Development
 Requires: infinipath-psm = %{version}-%{release}
 Provides: infinipath-psm-devel = %{version}
-# MIC package
-Conflicts: intel-mic-devel
-# OFED package
-Obsoletes: infinipath-devel <= %{version}-%{release}
-Conflicts: infinipath-devel <= %{version}-%{release}
-# mpss package
-Obsoletes: mpss-psm-dev <= %{version}-%{release}
-Conflicts: mpss-psm-dev <= %{version}-%{release}
-Requires(post): /sbin/ldconfig
-Requires(postun): /sbin/ldconfig
-
-%package -n intel-mic-psm
-Summary: Intel PSM Libraries
-License: GPL
-Group: System Environment/Libraries
-Prefix: /usr
-Provides: intel-mic-psm = %{version}
-# non-MIC package
-Conflicts: infinipath-psm
-# OFED package
-Obsoletes: infinipath-libs <= %{version}-%{release}
-Conflicts: infinipath-libs <= %{version}-%{release}
-# mpss package
-Obsoletes: mpss-psm <= %{version}-%{release}
-Conflicts: mpss-psm <= %{version}-%{release}
-Requires(post): /sbin/ldconfig
-Requires(postun): /sbin/ldconfig
-
-%package -n intel-mic-psm-devel
-Summary: Development files for Intel PSM
-Group: System Environment/Development
-Requires: intel-mic-psm = %{version}-%{release}
+%if "%{PSM_HAVE_SCIF}" == "1"
 Provides: intel-mic-psm-devel = %{version}
-# non-MIC package
-Conflicts: infinipath-psm-devel
+%endif
+# MIC package
+Obsoletes: intel-mic-psm-devel
 # OFED package
 Obsoletes: infinipath-devel <= %{version}-%{release}
 Conflicts: infinipath-devel <= %{version}-%{release}
@@ -141,16 +114,6 @@ interfaces in parallel environments.
 %description -n infinipath-psm-devel
 Development files for the libpsm_infinipath library
 
-%description -n intel-mic-psm
-The PSM Messaging API, or PSM API, is Intel's low-level
-user-level communications interface for the True Scale
-family of products. PSM users are enabled with mechanisms
-necessary to implement higher level communications
-interfaces in parallel environments.
-
-%description -n intel-mic-psm-devel
-Development files for the libpsm_infinipath library
-
 %prep
 %setup -q -n %{name}-%{version}-%{release}
 
@@ -171,27 +134,13 @@ rm -rf $RPM_BUILD_ROOT
 %post devel -p /sbin/ldconfig
 %postun devel -p /sbin/ldconfig
 
-%if "%{PSM_HAVE_SCIF}" == "1"
-%files -n intel-mic-psm
-%defattr(-,root,root,-)
-/usr/lib64/libpsm_infinipath.so.*
-/usr/lib64/libinfinipath.so.*
-/usr/sbin/psmd
-
-%files -n intel-mic-psm-devel
-%defattr(-,root,root,-)
-/usr/lib64/libpsm_infinipath.so
-/usr/lib64/libinfinipath.so
-/usr/include/psm.h
-/usr/include/psm_mq.h
-%endif
-
-
-%if "%{PSM_HAVE_SCIF}" == "0"
 %files
 %defattr(-,root,root,-)
 /usr/lib64/libpsm_infinipath.so.*
 /usr/lib64/libinfinipath.so.*
+%if "%{PSM_HAVE_SCIF}" == "1"
+/usr/sbin/psmd
+%endif
 
 %files -n infinipath-psm-devel
 %defattr(-,root,root,-)
@@ -199,11 +148,12 @@ rm -rf $RPM_BUILD_ROOT
 /usr/lib64/libinfinipath.so
 /usr/include/psm.h
 /usr/include/psm_mq.h
-%endif
 
 
 
 %changelog
+* Fri Sep 25 2015 Henry Estela <henry.r.estela@intel.com> - 3.3-1
+- Always build infinipath-psm with different Provides names.
 * Tue Nov 6 2012 Mitko Haralanov <mitko.haralanov@intel.com> - 3.3-1
 - Add Intel Xeon Phi related changes
 * Tue May 11 2010 Mitko Haralanov <mitko@qlogic.com> - 3.3-1

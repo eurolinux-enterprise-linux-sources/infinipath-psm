@@ -1,0 +1,34 @@
+From 7a06d71d0516ef0b5a65cfa957be1b68fe2e2078 Mon Sep 17 00:00:00 2001
+From: Henry Estela <henry.r.estela@intel.com>
+Date: Wed, 2 Dec 2015 17:44:18 -0600
+Subject: [PATCH] Fix executable stack reported by readelf -l. Fixes
+ 01org/psm#4
+
+
+diff --git a/ipath/ipath_dwordcpy-i386.S b/ipath/ipath_dwordcpy-i386.S
+index 4bf68be861..970651c67d 100644
+--- a/ipath/ipath_dwordcpy-i386.S
++++ b/ipath/ipath_dwordcpy-i386.S
+@@ -56,3 +56,7 @@ ipath_dwordcpy:
+ 	mov %eax,%edi
+ 	mov %edx,%esi
+ 	ret
++
++#if defined(__linux__) && defined(__ELF__)
++.section .note.GNU-stack,"",%progbits
++#endif
+diff --git a/ipath/ipath_dwordcpy-x86_64-fast.S b/ipath/ipath_dwordcpy-x86_64-fast.S
+index ea20095767..6465aaef0c 100644
+--- a/ipath/ipath_dwordcpy-x86_64-fast.S
++++ b/ipath/ipath_dwordcpy-x86_64-fast.S
+@@ -49,3 +49,7 @@ ipath_dwordcpy:
+ 	rep
+ 	movsd
+ 	ret
++
++#if defined(__linux__) && defined(__ELF__)
++.section .note.GNU-stack,"",%progbits
++#endif
+-- 
+2.5.0
+
