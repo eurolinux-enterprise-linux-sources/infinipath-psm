@@ -1,12 +1,12 @@
 # infinipath-psm
-%global git_version 22_g4abbc60_open
+%global git_version 25_g326b95a_open
 %global _hardened_build 1
 %global MAKEARG PSM_HAVE_SCIF=0 MIC=0
 
 Summary: QLogic PSM Libraries
 Name: infinipath-psm
 Version: 3.3
-Release: %{git_version}.2%{?dist}
+Release: %{git_version}.1%{?dist}
 License: BSD or GPLv2
 ExclusiveArch: x86_64
 Group: System Environment/Libraries
@@ -15,13 +15,14 @@ URL: https://www.openfabrics.org/
 # The upstream git repo
 # git://github.com/01org/psm
 # The exact hash we used to create our local tarball
-# 4abbc60ab02c51efee91575605b3430059f71ab8
+# 326b95a386f7aeb56743d0b09b2f68f07b856f28
 Source0: %{name}-%{version}-%{git_version}.tar.gz
 Source1: ipath.rules
-Patch1: misleading-indentation.patch
 Patch2: remove-executable-permissions-for-header-files.patch
 # https://gcc.gnu.org/bugzilla/show_bug.cgi?id=56977
 Patch3: disable-Werror.patch
+Patch4: 0001-Include-sysmacros.h.patch
+Patch5: 0001-Extend-buffer-for-uvalue-and-pvalue.patch
 
 Requires(post): /sbin/ldconfig
 Requires(postun): /sbin/ldconfig
@@ -52,9 +53,10 @@ Development files for the libpsm_infinipath library
 
 %prep
 %setup -q -n infinipath-psm-%{version}-%{git_version}
-%patch1 -p1
 %patch2 -p1
 %patch3 -p1
+%patch4 -p1
+%patch5 -p1
 find libuuid -type f -not -name 'psm_uuid.[c|h]' -not -name Makefile -delete
 
 %build
@@ -85,6 +87,10 @@ install -m 0644 %{SOURCE1} %{buildroot}%{_sysconfdir}/udev/rules.d/60-ipath.rule
 %{_includedir}/psm_mq.h
 
 %changelog
+* Mon Feb 27 2017 Honggang Li <honli@redhat.com> - 3.3-25_g326b95a_open.1
+- Rebase to latest upstream release.
+- Resolves: bz1381971
+
 * Tue May 31 2016 Honggang Li <honli@redhat.com> - 3.3-22_g4abbc60_open.2
 - Obsoletes libpsm2-compat.
 - Related: bz1272022

@@ -33,7 +33,7 @@
 Summary: Intel PSM Libraries
 Name: infinipath-psm
 Version: 3.3
-Release: 22_g4abbc60_open
+Release: 25_g326b95a_open
 Epoch: 4
 License: GPL
 Group: System Environment/Libraries
@@ -55,7 +55,7 @@ Obsoletes: mpss-psm <= %{version}-%{release}
 Conflicts: mpss-psm <= %{version}-%{release}
 Requires(post): /sbin/ldconfig
 Requires(postun): /sbin/ldconfig
-Requires: libuuid = 2.28-1.fc24
+Requires: libuuid = 2.23.2-21.el7
 
 %package -n infinipath-psm-devel
 Summary: Development files for Intel PSM
@@ -75,7 +75,7 @@ Obsoletes: mpss-psm-dev <= %{version}-%{release}
 Conflicts: mpss-psm-dev <= %{version}-%{release}
 Requires(post): /sbin/ldconfig
 Requires(postun): /sbin/ldconfig
-Requires: libuuid-devel = 2.28-1.fc24
+Requires: libuuid-devel = 2.23.2-21.el7
 
 # %package card-devel
 # Summary: Development files for Intel Xeon Phi
