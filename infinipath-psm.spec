@@ -1,16 +1,23 @@
 # infinipath-psm
+%global git_version 0.g6f42cdb1bb8
+%global _hardened_build 1
+
 Summary: QLogic PSM Libraries
 Name: infinipath-psm
-Version: 3.2
-Release: 2_ga8c3e3e_open.2%{?dist}
+Version: 3.3
+Release: %{git_version}.2%{?dist}
 License: BSD or GPLv2
 ExclusiveArch: x86_64
 Group: System Environment/Libraries
-URL: http://www.openfabrics.org/downloads/infinipath-psm/infinipath-psm-3.2-2_ga8c3e3e_open.tar.gz
-Source0: infinipath-psm-3.2-2_ga8c3e3e_open.tar.gz
+# For information on OpenFabrics Alliance, which this package is a member of
+URL: https://www.openfabrics.org/
+# The upstream git repo
+# git://github.com/01org/psm
+# The exact hash we used to create our local tarball
+# 6f42cdb1bb8cc4f15149589ab5fa39775fa5470a
+Source0: infinipath-psm-%{version}-%{git_version}.tar.gz
 Source1: ipath.rules
 Patch0: infinipath-psm-3.2-build.patch
-Patch1: infinipath-psm-warnings.patch
 Prefix: /usr
 BuildRoot: %{_tmppath}/%{name}-%{version}-%{release}-root
 Requires(post): /sbin/ldconfig
@@ -38,23 +45,22 @@ interfaces in parallel environments.
 Development files for the libpsm_infinipath library
 
 %prep
-%setup -q -n infinipath-psm-3.2-2_ga8c3e3e_open
+%setup -q -n infinipath-psm-%{version}-%{git_version}
 %patch0 -p1 -b .build
-%patch1 -p1 -b .warnings
 
 %build
-make XCFLAGS="%{optflags}"
+make XCFLAGS="%{optflags} -Wno-format-security -Wno-error"
 
 %install
-rm -rf $RPM_BUILD_ROOT
-mkdir -p $RPM_BUILD_ROOT
-export DESTDIR=$RPM_BUILD_ROOT
+rm -rf %{buildroot}
+mkdir -p %{buildroot}
+export DESTDIR=%{buildroot}
 make install
-mkdir -p $RPM_BUILD_ROOT%{_sysconfdir}/udev/rules.d
-cp %{SOURCE1} $RPM_BUILD_ROOT%{_sysconfdir}/udev/rules.d/60-ipath.rules
+mkdir -p %{buildroot}%{_sysconfdir}/udev/rules.d
+cp %{SOURCE1} %{buildroot}%{_sysconfdir}/udev/rules.d/60-ipath.rules
 
 %clean
-rm -rf $RPM_BUILD_ROOT
+rm -rf %{buildroot}
 
 %post -p /sbin/ldconfig
 %postun -p /sbin/ldconfig
@@ -76,6 +82,14 @@ rm -rf $RPM_BUILD_ROOT
 
 
 %changelog
+* Mon Oct 27 2014 Doug Ledford <dledford@redhat.com> - 3.3-0.g6f42cdb1bb8.2
+- Fix missing FORTIFY_SOURCE setting
+- Related: bz1085255
+
+* Mon Oct 27 2014 Doug Ledford <dledford@redhat.com> - 3.3-0.g6f42cdb1bb8.1
+- Update from upstream git repo
+- Resolves: bz1085255
+
 * Mon Mar 3 2014 Jay Fenlason <fenlason@redhat.com> -3.2-2_ga8c3e3e_open.2
 - Update the -build patch and this spec file so the library is built
   with the standard optimization and security flags.

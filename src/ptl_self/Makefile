@@ -30,7 +30,6 @@
 # SOFTWARE.
 #
 
-top_srcdir := ..
 include $(top_srcdir)/buildflags.mak
 INCLUDES += -I$(top_srcdir)
 

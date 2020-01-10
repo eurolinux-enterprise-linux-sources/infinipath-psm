@@ -1,20 +1,23 @@
---- infinipath-psm-3.2-2_ga8c3e3e_open/buildflags.mak.execstack	2014-01-08 16:33:34.000000000 -0500
-+++ infinipath-psm-3.2-2_ga8c3e3e_open/buildflags.mak	2014-02-28 15:08:53.000000000 -0500
-@@ -80,7 +80,7 @@ endif
- ifneq (,${PSM_PROFILE})
-   BASECFLAGS += -DPSM_PROFILE
- endif
--BASECFLAGS += -fpic -fPIC -funwind-tables -D_GNU_SOURCE
-+BASECFLAGS += -fPIC -funwind-tables -D_GNU_SOURCE $(XCFLAGS)
+diff -up infinipath-psm-3.3-0.g6f42cdb1bb8/buildflags.mak.harden infinipath-psm-3.3-0.g6f42cdb1bb8/buildflags.mak
+--- infinipath-psm-3.3-0.g6f42cdb1bb8/buildflags.mak.harden	2014-10-27 15:41:59.686037305 -0400
++++ infinipath-psm-3.3-0.g6f42cdb1bb8/buildflags.mak	2014-10-27 15:59:04.112107149 -0400
+@@ -74,8 +74,8 @@ INCLUDES := -I. -I$(top_srcdir)/include
+ BASECFLAGS += $(BASE_FLAGS) $(if $(MIC:0=),$(if $(filter $(CC),icc),-mmic,-D__MIC__)) \
+ 	-Wall $(WERROR) $(if $(MIC:0=),-Wno-unused) -fpic -fPIC -D_GNU_SOURCE \
+ 	$(if $(filter $(CC),icc),,-funwind-tables) $(if $(PSM_PROFILE:0=),-DPSM_PROFILE) \
+-	${IPATH_CFLAGS}
+-ASFLAGS += $(BASE_FLAGS) $(if $(MIC:0=),$(if $(filter $(CC),icc),-mmic,-D__MIC__)) -g3 -fpic
++	${IPATH_CFLAGS} $(XCFLAGS)
++ASFLAGS += $(BASE_FLAGS) $(if $(MIC:0=),$(if $(filter $(CC),icc),-mmic,-D__MIC__)) -g3 -fpic -Wa,--noexecstack
  
+ LDFLAGS += $(SCIF_LINK_FLAGS)
+ 
+@@ -86,7 +86,7 @@ ifneq (,${PSM_DEBUG})
+   BASECFLAGS += -O -g3 -DPSM_DEBUG $(if $(filter $(CC),icc),,-funit-at-a-time) \
+ 	-Wp,-D_FORTIFY_SOURCE=2
+ else
+-  BASECFLAGS += -O3 -g3 
++  BASECFLAGS += -O3 -g3
+ endif
  ifeq (1,${PSM_USE_SYS_UUID})
    BASECFLAGS += -DPSM_USE_SYS_UUID
-@@ -93,7 +93,7 @@ else
-   CFLAGS += -DNVALGRIND
- endif
- 
--ASFLAGS += -g3 -fpic
-+ASFLAGS += -g3 -fpic -Wa,--noexecstack
- 
- BASECFLAGS += ${IPATH_CFLAGS}
- 
