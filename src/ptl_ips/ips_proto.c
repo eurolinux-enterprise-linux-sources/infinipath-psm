@@ -633,7 +633,8 @@ proto_sdma_init(struct ips_proto *proto, const psmi_context_t *context)
 		(union psmi_envvar_val) defval,
 		&env_sdma);
 
-    proto->flags |= env_sdma.e_uint & IPS_PROTO_FLAGS_ALL_SDMA;
+    if(env_sdma.e_uint != 1)
+      proto->flags |= env_sdma.e_uint & IPS_PROTO_FLAGS_ALL_SDMA;
 
     /* If anything uses send dma, figure out our max packet threshold to call
      * send dma with */
@@ -761,7 +762,7 @@ _build_ctrl_message(struct ips_proto *proto,
     uint32_t tot_paywords = sizeof(struct ips_message_header) >> 2;
     struct ips_epinfo *epinfo = &proto->epinfo;
     struct ips_epinfo_remote *epr = &ipsaddr->epr;
-    uint16_t pkt_flags = 0;
+    uint16_t pkt_flags = IPS_EPSTATE_COMMIDX_PACK(epr->epr_commidx_to);
     struct ips_message_header *p_hdr = &msg->pbc_hdr.hdr;
     ips_path_rec_t *ctrl_path = ipsaddr->epr.epr_path[IPS_PATH_HIGH_PRIORITY][ipsaddr->epr.epr_hpp_index];
     int paylen = 0;

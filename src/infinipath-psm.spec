@@ -31,17 +31,23 @@
 #
 
 Summary: Intel PSM Libraries
-Name: intel-mic-psm
-Version: @VERSION@
-Release: @RELEASE@
+Name: infinipath-psm
+Version: 3.3
+Release: 22_g4abbc60_open
+Epoch: 4
 License: GPL
 Group: System Environment/Libraries
 URL: http://www.intel.com/
 Source0: %{name}-%{version}-%{release}.tar.gz
 Prefix: /usr
 BuildRoot: %{_tmppath}/%{name}-%{version}-%{release}-root
-Provides: %{name} = %{version}
-# ifs package
+Provides: infinipath-psm = %{version}
+%if "%{PSM_HAVE_SCIF}" == "1"
+Provides: intel-mic-psm = %{version}
+%endif
+# MIC package
+Obsoletes: intel-mic-psm
+# OFED package
 Obsoletes: infinipath-libs <= %{version}-%{release}
 Conflicts: infinipath-libs <= %{version}-%{release}
 # mpss package
@@ -49,43 +55,19 @@ Obsoletes: mpss-psm <= %{version}-%{release}
 Conflicts: mpss-psm <= %{version}-%{release}
 Requires(post): /sbin/ldconfig
 Requires(postun): /sbin/ldconfig
-@REQUIRES@
-
-%package devel
-Summary: Development files for Intel PSM
-Group: System Environment/Development
-Requires: %{name} = %{version}-%{release}
-Provides: %{name}-devel = %{version}
-# ifs package
-Obsoletes: infinipath-devel <= %{version}-%{release}
-Conflicts: infinipath-devel <= %{version}-%{release}
-# mpss package
-Obsoletes: mpss-psm-dev <= %{version}-%{release}
-Conflicts: mpss-psm-dev <= %{version}-%{release}
-Requires(post): /sbin/ldconfig
-Requires(postun): /sbin/ldconfig
-@REQUIRES-DEVEL@
-
-
-%package -n infinipath-psm
-Summary: QLogic PSM Libraries
-Epoch: 4
-License: GPL
-Group: System Environment/Libraries
-URL: http://www.qlogic.com/
-Prefix: /usr
-Provides: infinipath-psm = %{version}
-Conflicts: infinipath-libs intel-mic-psm
-Requires(post): /sbin/ldconfig
-Requires(postun): /sbin/ldconfig
-@REQUIRES@
+Requires: libuuid = 2.28-1.fc24
 
 %package -n infinipath-psm-devel
 Summary: Development files for Intel PSM
 Group: System Environment/Development
 Requires: infinipath-psm = %{version}-%{release}
 Provides: infinipath-psm-devel = %{version}
-# ifs package
+%if "%{PSM_HAVE_SCIF}" == "1"
+Provides: intel-mic-psm-devel = %{version}
+%endif
+# MIC package
+Obsoletes: intel-mic-psm-devel
+# OFED package
 Obsoletes: infinipath-devel <= %{version}-%{release}
 Conflicts: infinipath-devel <= %{version}-%{release}
 # mpss package
@@ -93,7 +75,7 @@ Obsoletes: mpss-psm-dev <= %{version}-%{release}
 Conflicts: mpss-psm-dev <= %{version}-%{release}
 Requires(post): /sbin/ldconfig
 Requires(postun): /sbin/ldconfig
-@REQUIRES-DEVEL@
+Requires: libuuid-devel = 2.28-1.fc24
 
 # %package card-devel
 # Summary: Development files for Intel Xeon Phi
@@ -105,7 +87,6 @@ Requires(postun): /sbin/ldconfig
 
 %global debug_package %{nil}
 
-#%{!?install_prefix:%define install_prefix /usr}
 #PSM_HAVE_SCIF is one of: 0 1
 %{!?PSM_HAVE_SCIF:     %global PSM_HAVE_SCIF 0}
 
@@ -132,16 +113,6 @@ family of products. PSM users are enabled with mechanisms
 necessary to implement higher level communications
 interfaces in parallel environments.
 
-%description devel
-Development files for the libpsm_infinipath library
-
-%description -n infinipath-psm
-The PSM Messaging API, or PSM API, is QLogic's low-level
-user-level communications interface for the Truescale
-family of products. PSM users are enabled with mechanisms
-necessary to implement higher level communications
-interfaces in parallel environments.
-
 %description -n infinipath-psm-devel
 Development files for the libpsm_infinipath library
 
@@ -149,15 +120,13 @@ Development files for the libpsm_infinipath library
 %setup -q -n %{name}-%{version}-%{release}
 
 %build
-%{__make} @PSM_UUID@ %{MAKEARG}
+%{__make}  %{MAKEARG}
 
 %install
 rm -rf $RPM_BUILD_ROOT
 mkdir -p $RPM_BUILD_ROOT
 export DESTDIR=$RPM_BUILD_ROOT
 %{__make} install %{MAKEARG}
-
-
 
 %clean
 rm -rf $RPM_BUILD_ROOT
@@ -167,41 +136,28 @@ rm -rf $RPM_BUILD_ROOT
 %post devel -p /sbin/ldconfig
 %postun devel -p /sbin/ldconfig
 
-%if "%{PSM_HAVE_SCIF}" == "1"
 %files
 %defattr(-,root,root,-)
-%{install_prefix}/lib64/libpsm_infinipath.so.*
-%{install_prefix}/lib64/libinfinipath.so.*
+/usr/lib64/libpsm_infinipath.so.*
+/usr/lib64/libinfinipath.so.*
+%if "%{PSM_HAVE_SCIF}" == "1"
 /usr/sbin/psmd
-
-%files devel
-%defattr(-,root,root,-)
-%{install_prefix}/lib64/libpsm_infinipath.so
-%{install_prefix}/lib64/libinfinipath.so
-/usr/include/psm.h
-/usr/include/psm_mq.h
 %endif
-
-
-%if "%{PSM_HAVE_SCIF}" == "0"
-%files -n infinipath-psm
-%defattr(-,root,root,-)
-%{install_prefix}/lib64/libpsm_infinipath.so.*
-%{install_prefix}/lib64/libinfinipath.so.*
 
 %files -n infinipath-psm-devel
 %defattr(-,root,root,-)
-%{install_prefix}/lib64/libpsm_infinipath.so
-%{install_prefix}/lib64/libinfinipath.so
+/usr/lib64/libpsm_infinipath.so
+/usr/lib64/libinfinipath.so
 /usr/include/psm.h
 /usr/include/psm_mq.h
-%endif
 
 
 
 %changelog
-* Tue Nov 6 2012 Mitko Haralanov <mitko.haralanov@intel.com> - @VERSION@-1
+* Fri Sep 25 2015 Henry Estela <henry.r.estela@intel.com> - 3.3-1
+- Always build infinipath-psm with different Provides names.
+* Tue Nov 6 2012 Mitko Haralanov <mitko.haralanov@intel.com> - 3.3-1
 - Add Intel Xeon Phi related changes
-* Tue May 11 2010 Mitko Haralanov <mitko@qlogic.com> - @VERSION@-1
+* Tue May 11 2010 Mitko Haralanov <mitko@qlogic.com> - 3.3-1
 - Initial build.
 

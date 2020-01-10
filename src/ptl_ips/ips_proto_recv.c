@@ -789,7 +789,7 @@ _process_err_chk_gen(ips_epaddr_t *ipsaddr, struct ips_message_header *p_hdr)
   ptl_arg_t desc_id = p_hdr->data[0];
   ptl_arg_t send_desc_id = p_hdr->data[1];
   ptl_arg_t desc_tidrecvc;
-  ptl_arg_t args[3];
+  ptl_arg_t args[3] = {};
   int16_t seq_off;
   uint8_t ack_type;
   
@@ -1263,7 +1263,8 @@ ips_proto_process_packet_error(struct ips_recvhdrq_event *rcv_ev)
 	    
 	    /* Obtain ipsaddr for packet */
 	    epstaddr = ips_epstate_lookup(rcv_ev->recvq->epstate, 
-					  rcv_ev->p_hdr->commidx);	    
+        rcv_ev->p_hdr->commidx +
+        INFINIPATH_KPF_RESERVED_BITS(p_hdr->iph.pkt_flags));
 	    if_pf (epstaddr == NULL || epstaddr->epid != rcv_ev->epid)
 	      return 0; /* Unknown packet - drop */
 	    

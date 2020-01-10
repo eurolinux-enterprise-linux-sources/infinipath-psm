@@ -1,6 +1,7 @@
 # infinipath-psm
-%global git_version 0.g6f42cdb1bb8
+%global git_version 22_g4abbc60_open
 %global _hardened_build 1
+%global MAKEARG PSM_HAVE_SCIF=0 MIC=0
 
 Summary: QLogic PSM Libraries
 Name: infinipath-psm
@@ -14,25 +15,30 @@ URL: https://www.openfabrics.org/
 # The upstream git repo
 # git://github.com/01org/psm
 # The exact hash we used to create our local tarball
-# 6f42cdb1bb8cc4f15149589ab5fa39775fa5470a
-Source0: infinipath-psm-%{version}-%{git_version}.tar.gz
+# 4abbc60ab02c51efee91575605b3430059f71ab8
+Source0: %{name}-%{version}-%{git_version}.tar.gz
 Source1: ipath.rules
-Patch0: infinipath-psm-3.2-build.patch
-Prefix: /usr
-BuildRoot: %{_tmppath}/%{name}-%{version}-%{release}-root
+Patch1: misleading-indentation.patch
+Patch2: remove-executable-permissions-for-header-files.patch
+# https://gcc.gnu.org/bugzilla/show_bug.cgi?id=56977
+Patch3: disable-Werror.patch
+
 Requires(post): /sbin/ldconfig
 Requires(postun): /sbin/ldconfig
-Requires: libuuid >= 2.17.2-3.el6
-Conflicts: infinipath-libs
+Requires: udev
+BuildRequires: gcc
+BuildRequires: libuuid-devel
+Conflicts: infinipath-libs <= %{version}-%{release}
+Obsoletes: libpsm2-compat
 
 %package devel
 Summary: Development files for QLogic PSM
 Group: System Environment/Development
-Requires: %{name} = %{version}-%{release}
+Requires: %{name}%{?_isa} = %{version}-%{release}
 Requires(post): /sbin/ldconfig
 Requires(postun): /sbin/ldconfig
-Requires: libuuid-devel >= 2.17.2-3.el6
-Conflicts: infinipath-devel
+Requires: libuuid-devel
+Conflicts: infinipath-devel <= %{version}-%{release}
 
 %description
 The PSM Messaging API, or PSM API, is QLogic's low-level
@@ -46,21 +52,19 @@ Development files for the libpsm_infinipath library
 
 %prep
 %setup -q -n infinipath-psm-%{version}-%{git_version}
-%patch0 -p1 -b .build
+%patch1 -p1
+%patch2 -p1
+%patch3 -p1
+find libuuid -type f -not -name 'psm_uuid.[c|h]' -not -name Makefile -delete
 
 %build
-make XCFLAGS="%{optflags} -Wno-format-security -Wno-error"
+export CFLAGS="$RPM_OPT_FLAGS"
+%make_build PSM_USE_SYS_UUID=1 %{MAKEARG} CC=gcc
 
 %install
-rm -rf %{buildroot}
-mkdir -p %{buildroot}
-export DESTDIR=%{buildroot}
-make install
-mkdir -p %{buildroot}%{_sysconfdir}/udev/rules.d
-cp %{SOURCE1} %{buildroot}%{_sysconfdir}/udev/rules.d/60-ipath.rules
-
-%clean
-rm -rf %{buildroot}
+%make_install %{MAKEARG}
+install -d %{buildroot}%{_sysconfdir}/udev/rules.d
+install -m 0644 %{SOURCE1} %{buildroot}%{_sysconfdir}/udev/rules.d/60-ipath.rules
 
 %post -p /sbin/ldconfig
 %postun -p /sbin/ldconfig
@@ -68,20 +72,29 @@ rm -rf %{buildroot}
 %postun devel -p /sbin/ldconfig
 
 %files
-%defattr(-,root,root,-)
 %{_sysconfdir}/udev/rules.d/60-ipath.rules
 %{_libdir}/libpsm_infinipath.so.*
 %{_libdir}/libinfinipath.so.*
+%license COPYING
+%doc README
 
 %files devel
-%defattr(-,root,root,-)
 %{_libdir}/libpsm_infinipath.so
 %{_libdir}/libinfinipath.so
 %{_includedir}/psm.h
 %{_includedir}/psm_mq.h
 
-
 %changelog
+* Tue May 31 2016 Honggang Li <honli@redhat.com> - 3.3-22_g4abbc60_open.2
+- Obsoletes libpsm2-compat.
+- Related: bz1272022
+
+* Thu Apr 21 2016 Honggang Li <honli@redhat.com> - 3.3-22_g4abbc60_open.1
+- Rebase to latest upstream release.
+- Link against system libuuid library.
+- Spec file cleanup.
+- Related: bz1272022
+
 * Mon Oct 27 2014 Doug Ledford <dledford@redhat.com> - 3.3-0.g6f42cdb1bb8.2
 - Fix missing FORTIFY_SOURCE setting
 - Related: bz1085255

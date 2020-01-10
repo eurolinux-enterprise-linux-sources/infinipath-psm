@@ -36,8 +36,13 @@
 
 #include "psm_user.h"
 
-typedef uint16_t ips_epstate_idx;
-#define IPS_EPSTATE_COMMIDX_MAX 65535
+typedef uint32_t ips_epstate_idx;
+#define IPS_EPSTATE_COMMIDX_MAX (1<<20)
+#define IPS_EPSTATE_COMMIDX_MASK 0xF0000
+#define IPS_EPSTATE_COMMIDX_SHIFT 14
+#define IPS_EPSTATE_COMMIDX_PACK(ipscommidx) \
+  ((ipscommidx & IPS_EPSTATE_COMMIDX_MASK) \
+    >> IPS_EPSTATE_COMMIDX_SHIFT)
 
 struct ptl_epaddr;
 
@@ -68,7 +73,7 @@ PSMI_INLINE(
 struct ips_epstate_entry *
 ips_epstate_lookup(const struct ips_epstate *eps, ips_epstate_idx idx))
 {
-    idx += eps->eps_base_idx;
+  idx = (idx + eps->eps_base_idx) & (IPS_EPSTATE_COMMIDX_MAX-1);
     if (idx < eps->eps_tabsize)
 	return &eps->eps_tab[idx];
     else
