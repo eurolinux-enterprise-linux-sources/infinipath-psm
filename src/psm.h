@@ -67,9 +67,9 @@ typedef struct psm_ep *psm_ep_t;
  * psm_mq_init).  */
 typedef struct psm_mq *psm_mq_t;
 
-#define PSM_VERNO       0x0110
-#define PSM_VERNO_MAJOR 0x01
-#define PSM_VERNO_MINOR 0x10
+#define PSM_VERNO       0x010f 
+#define PSM_VERNO_MAJOR 0x01   
+#define PSM_VERNO_MINOR 0x0f   
 
 enum psm_error {
     
@@ -275,7 +275,7 @@ typedef struct psm_error_token	*psm_error_token_t;
  * individually set for each opened endpoint.  By default, endpoints will
  * inherit the global handler registered at the time of open. 
  *
- * [in] ep Handle associated to the endpoint over which the error occurred
+ * [in] ep Handle associated to the endpoint over which the error occured
  *               or NULL if the error is being handled by the global error
  *               handler.
  * [in] error PSM error identifier

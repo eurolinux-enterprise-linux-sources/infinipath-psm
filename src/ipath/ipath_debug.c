@@ -52,7 +52,6 @@ FILE *__ipath_dbgout;
 static void init_ipath_mylabel(void) __attribute__ ((constructor));
 static void init_ipath_backtrace(void) __attribute__ ((constructor));
 static void init_ipath_dbgfile(void) __attribute__ ((constructor));
-static void fini_ipath_backtrace(void) __attribute__ ((destructor));
 
 static void init_ipath_mylabel(void)
 {
@@ -88,7 +87,6 @@ ipath_sighdlr(int sig, siginfo_t *p1, void *ucv)
     static void *backaddr[128]; // avoid stack usage
     static char buf[150], hname[64], fname[128];
     static int i, j, fd, id;
-    static int write_result __unused__;
     extern char *__progname;
 
     // If this is a SIGINT do not display backtrace. Just invoke exit handlers
@@ -113,7 +111,7 @@ ipath_sighdlr(int sig, siginfo_t *p1, void *ucv)
 #endif
     }
     id += snprintf(buf+id, sizeof buf-id, ".  Backtrace:\n");
-    write_result = write(2, buf, id);
+    (void)write(2, buf, id);
 
     i = backtrace(backaddr, sizeof(backaddr)/sizeof(backaddr[0]));
     if(i>2) // skip ourselves and backtrace
@@ -133,20 +131,13 @@ ipath_sighdlr(int sig, siginfo_t *p1, void *ucv)
     hname[sizeof(hname) - 1] = '\0';
     snprintf(fname, sizeof fname, "%s.80s-%u,%.32s.btr", __progname, getpid(), hname);
     if((fd=open(fname, O_CREAT|O_WRONLY, 0644))>=0) {
-        write_result = write(fd, buf, id);
+        (void)write(fd, buf, id);
         backtrace_symbols_fd(backaddr+j,  i, fd);
         (void)fsync(fd);
         (void)close(fd);
     }
     exit(1); // not _exit(), want atexit handlers to get run
 }
-
-static struct sigaction sigsegv_act;
-static struct sigaction sigbus_act;
-static struct sigaction sigill_act;
-static struct sigaction sigabrt_act;
-static struct sigaction sigint_act;
-static struct sigaction sigterm_act;
 
 // we do this as a constructor so any user program that sets signal
 // handlers for these will override our settings, but we still
@@ -160,24 +151,12 @@ static void init_ipath_backtrace(void)
 
     if(!getenv("IPATH_NO_BACKTRACE"))  {// permanent, although probably
         // undocumented way to disable backtraces.
-        (void)sigaction(SIGSEGV, &act, &sigsegv_act);
-        (void)sigaction(SIGBUS,  &act, &sigbus_act);
-        (void)sigaction(SIGILL,  &act, &sigill_act);
-        (void)sigaction(SIGABRT, &act, &sigabrt_act);
-        (void)sigaction(SIGINT,  &act, &sigint_act);
-        (void)sigaction(SIGTERM, &act, &sigterm_act);
-    }
-}
-
-static void fini_ipath_backtrace(void)
-{
-    if(!getenv("IPATH_NO_BACKTRACE"))  {
-        (void)sigaction(SIGSEGV, &sigsegv_act, NULL);
-        (void)sigaction(SIGBUS,  &sigbus_act, NULL);
-        (void)sigaction(SIGILL,  &sigill_act, NULL);
-        (void)sigaction(SIGABRT, &sigabrt_act, NULL);
-        (void)sigaction(SIGINT,  &sigint_act, NULL);
-        (void)sigaction(SIGTERM, &sigterm_act, NULL);
+        (void)sigaction(SIGSEGV, &act, NULL);
+        (void)sigaction(SIGBUS,  &act, NULL);
+        (void)sigaction(SIGILL,  &act, NULL);
+        (void)sigaction(SIGABRT, &act, NULL);
+	(void)sigaction(SIGINT,  &act, NULL);
+	(void)sigaction(SIGTERM, &act, NULL);
     }
 }
 

@@ -367,8 +367,7 @@ do_pkt_cksum(struct ips_recvhdrq_event *rcv_ev)
     uint32_t hd, tl;
     
     epstaddr =
-      ips_epstate_lookup(rcv_ev->recvq->epstate, rcv_ev->p_hdr->commidx +
-          INFINIPATH_KPF_RESERVED_BITS(rcv_ev->p_hdr->iph.pkt_flags));
+      ips_epstate_lookup(rcv_ev->recvq->epstate, rcv_ev->p_hdr->commidx);
     epstaddr = (epstaddr && epstaddr->ipsaddr) ? epstaddr : NULL;
     
     lcontext = 
@@ -393,6 +392,7 @@ PSMI_ALWAYS_INLINE(
 void
 process_pending_acks(struct ips_recvhdrq *recvq))
 {
+  
   /* If any pending acks, dispatch them now */
   while (!SLIST_EMPTY(&recvq->pending_acks)) {
     struct ips_flow *flow = SLIST_FIRST(&recvq->pending_acks);
@@ -404,14 +404,14 @@ process_pending_acks(struct ips_recvhdrq *recvq))
       psmi_assert_always((flow->flags & IPS_FLOW_FLAG_PENDING_NAK) == 0);
       
       flow->flags &= ~IPS_FLOW_FLAG_PENDING_ACK;
-      ips_proto_send_ctrl_message(flow, OPCODE_ACK, 
+      (void)ips_proto_send_ctrl_message(flow, OPCODE_ACK,
 					&flow->ipsaddr->ctrl_msg_queued, NULL);
     }
     else {
       psmi_assert_always(flow->flags & IPS_FLOW_FLAG_PENDING_NAK);
       
       flow->flags &= ~IPS_FLOW_FLAG_PENDING_NAK;
-      ips_proto_send_ctrl_message(flow, OPCODE_NAK, 
+      (void)ips_proto_send_ctrl_message(flow, OPCODE_NAK,
 					&flow->ipsaddr->ctrl_msg_queued, NULL);
     }
     
@@ -492,8 +492,7 @@ ips_recvhdrq_progress(struct ips_recvhdrq *recvq)
 	rcv_ev.has_cksum = 
 	  ((recvq->proto->flags & IPS_PROTO_FLAG_CKSUM) &&
 	   (rcv_ev.ptype == RCVHQ_RCV_TYPE_EAGER) &&
-	   (rcv_ev.p_hdr->mqhdr != MQ_MSG_DATA_BLK) &&
-	   (rcv_ev.p_hdr->mqhdr != MQ_MSG_DATA_REQ_BLK));
+	   (rcv_ev.p_hdr->mqhdr != MQ_MSG_DATA_BLK));
 	
 	if_pt (recvq->proto->flags & IPS_PROTO_FLAG_CCA) {
 	  /* IBTA CCA handling:
@@ -581,9 +580,7 @@ ips_recvhdrq_progress(struct ips_recvhdrq *recvq)
 	    /* Classify packet from a known or unknown endpoint */
 	    struct ips_epstate_entry *epstaddr;
 
-      epstaddr =
-        ips_epstate_lookup(recvq->epstate, rcv_ev.p_hdr->commidx +
-            INFINIPATH_KPF_RESERVED_BITS(rcv_ev.p_hdr->iph.pkt_flags));
+	    epstaddr = ips_epstate_lookup(recvq->epstate, rcv_ev.p_hdr->commidx);	    
 	    if_pf (epstaddr == NULL || epstaddr->epid != rcv_ev.epid) {
 	        rcv_ev.ipsaddr = NULL;
 		recvq->recvq_callbacks.callback_packet_unknown(&rcv_ev);

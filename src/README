@@ -1,5 +1,5 @@
 
-  Copyright (c) 2013-2014, Intel Corporation.  All rights reserved.
+  Copyright (c) 2013 Intel Corporation.  All rights reserved.
   Copyright (c) 2006-2011. QLogic Corporation. All rights reserved.
   Copyright (c) 2003-2006, PathScale, Inc. All rights reserved.
  
@@ -35,18 +35,23 @@
 
 OFED Support
 ------------
-OFED 3.5 or above should be installed on the node. Prior versions of OFED
+OFED 1.5.1rc2 or above should be installed on the node. Prior versions of OFED
 have an older QLogic IB driver (ib_qib) and do not fully support all the PSM
 features with this release.
 
 Building PSM
 ------------
-Build requires that GNU GCC compiler is installed on the machine doing the
-build.  If compiling code for MIC, SCIF must be present.  Root privileges 
-are required to install the runtime libraries and development header files 
-into the standard system location.
+Build requires that GNU GCC compiler is installed on 
+the machine doing the build. Root privileges are required to install the
+runtime libraries and development header files into standard system location.
+There are two mechanisms for building PSM:
+  1. Use provided Makefiles to build and install
+  2. Generate a tarball that can be used to build source and binary RPMs
 
-Building from Makefile
+The instructions below use $PRODUCT and $RELEASE to refer to the product
+and release identifiers of the infinipath-psm RPM.
+
+Building from Makefiles
 -----------------------
 1. Untar the tarball:
 	$ tar zxvf infinipath-psm-$PRODUCT-$RELEASE.tar.gz
@@ -57,21 +62,8 @@ Building from Makefile
    are installed. If so, it will use the system's libuuid. Otherwise, PSM
    will be compiled with the libuuid included with PSM.
 	$ make
-
-   The Makefile will attempt to detect if SCIF is present, and if found, it will
-   build the SCIF enabled variant by default.  Auto-detection of SCIF can be
-   disabled by passing the PSM_HAVE_SCIF variable.
-
-   To specify the SCIF-enabled version, set the PSM_HAVE_SCIF variable:
-        $ make PSM_HAVE_SCIF=1
-   To specify the non-SCIF version, even if SCIF is present, clear the variable:
-        $ make PSM_HAVE_SCIF=0
-
    To force compiling with the included libuuid, use the USE_PSM_UUID variable:
         $ make USE_PSM_UUID=1
-
-   (PSM_HAVE_SCIF and USE_PSM_UUID may be used in conjunction)
-
 4. Install the libraries and header files on the system (as root):
 	$ make install
 
@@ -87,6 +79,34 @@ install all files (libraries and headers) into "/tmp/psm-install/usr/...",
 libraries in "/tmp/psm-install/libraries" and the headers in
 "/tmp/psm-install/usr/include", and "make LIBDIR=/tmp/libs install" will
 install the libraries in "/tmp/libs" and the headers in "/usr/include".
+
+Generating PSM source and binary RPMs
+--------------------------------------
+This is a two step process: Generate a PSM distribution tarball which can then
+be used to generate source and binary RPMs using the rpmbuild command with the
+-ta option.
+1. Untar the tarball:
+	$ tar zxvf infinipath-psm-$PRODUCT-$RELEASE.tar.gz
+2. Change directory into the untarred location:
+	$ cd infinipath-psm-$PRODUCT-$RELEASE
+3. Generate distribution tarball
+   	$ make dist
+   To force compiling with the included libuuid, use the USE_PSM_UUID variable:
+        $ make dist USE_PSM_UUID=1
+   Note: It is recommended if you are planning on doing cross distribution
+builds to use the included libuuid i.e. If you are generating the distribution
+tarball on a RHEL machine but may use rpmbuild on a SuSE SLES machine. This
+minimized any cross distribution dependencies for the package.
+4. Generate source and binary packages
+   	$ rpmbuild -ta infinipath-psm-$PRODUCT-$RELEASE.tar.gz
+   Please refere to the man page of rpmbuild for other options in generating
+RPMs. The generated RPMs are relocatable so one can provide the prefix option
+to retarget the installation location.
+
+If you run into any issues during build please post any questions with as much 
+information as possible to the psm-devel mailing list. Please include the 
+distribution you are building on, the compiler type and version as well as any 
+relevant error messages.
 
 MPI Libraries supported
 -----------------------

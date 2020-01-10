@@ -318,9 +318,7 @@ psmi_epaddr_get_hostname(psm_epid_t epid)
 	return h;
     else {
 	uint64_t lid, context, subcontext;
-	lid = PSMI_EPID_GET_LID(epid);
-	context = PSMI_EPID_GET_CONTEXT(epid);
-	subcontext = PSMI_EPID_GET_SUBCONTEXT(epid);
+	PSMI_EPID_UNPACK(epid, lid, context, subcontext);
 	snprintf(hostname, PSMI_EP_HOSTNAME_LEN-1, "LID=0x%04x:%d.%d",
 		(unsigned int) lid, (int) context, (int) subcontext);
 	hostname[PSMI_EP_HOSTNAME_LEN-1] = '\0';
@@ -336,10 +334,7 @@ psmi_epaddr_get_name(psm_epid_t epid)
     static int bufno = 0;
     char *h, *hostname;
     uint64_t lid, context, subcontext;
-
-    lid = PSMI_EPID_GET_LID(epid);
-    context = PSMI_EPID_GET_CONTEXT(epid);
-    subcontext = PSMI_EPID_GET_SUBCONTEXT(epid);
+    PSMI_EPID_UNPACK(epid, lid, context, subcontext);
     hostname = hostnamebufs[bufno];
     bufno = (bufno + 1) % 4;
 
@@ -930,7 +925,7 @@ psmi_faultinj_getspec(char *spec_name, int num, int denom)
 
     /* We got here, so no spec -- allocate one */
     fi = psmi_malloc(PSMI_EP_NONE, UNDEFINED, sizeof(struct psmi_faultinj_spec));
-    strncpy(fi->spec_name, spec_name, PSMI_FAULTINJ_SPEC_NAMELEN-1);
+    strncpy(fi->spec_name, spec_name, PSMI_FAULTINJ_SPEC_NAMELEN);
     fi->spec_name[PSMI_FAULTINJ_SPEC_NAMELEN-1] = '\0';
     fi->num = num;
     fi->denom = denom;
@@ -1202,7 +1197,7 @@ psmi_coreopt_ctl(const void *core_obj, int optname,
   
  fail:
   /* Unrecognized/unknown option */
-  return psmi_handle_error(NULL, PSM_PARAM_ERR, err_string, "%s");
+  return psmi_handle_error(NULL, PSM_PARAM_ERR, err_string);
 }
 
 psm_error_t psmi_core_setopt(const void *core_obj, int optname, 

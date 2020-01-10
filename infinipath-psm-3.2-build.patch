@@ -1,0 +1,20 @@
+--- infinipath-psm-3.2-2_ga8c3e3e_open/buildflags.mak.execstack	2014-01-08 16:33:34.000000000 -0500
++++ infinipath-psm-3.2-2_ga8c3e3e_open/buildflags.mak	2014-02-28 15:08:53.000000000 -0500
+@@ -80,7 +80,7 @@ endif
+ ifneq (,${PSM_PROFILE})
+   BASECFLAGS += -DPSM_PROFILE
+ endif
+-BASECFLAGS += -fpic -fPIC -funwind-tables -D_GNU_SOURCE
++BASECFLAGS += -fPIC -funwind-tables -D_GNU_SOURCE $(XCFLAGS)
+ 
+ ifeq (1,${PSM_USE_SYS_UUID})
+   BASECFLAGS += -DPSM_USE_SYS_UUID
+@@ -93,7 +93,7 @@ else
+   CFLAGS += -DNVALGRIND
+ endif
+ 
+-ASFLAGS += -g3 -fpic
++ASFLAGS += -g3 -fpic -Wa,--noexecstack
+ 
+ BASECFLAGS += ${IPATH_CFLAGS}
+ 

@@ -1,44 +1,31 @@
 # infinipath-psm
-%global git_version 26_g604758e_open
-%global _hardened_build 1
-%global MAKEARG PSM_HAVE_SCIF=0 MIC=0
-
 Summary: QLogic PSM Libraries
 Name: infinipath-psm
-Version: 3.3
-Release: %{git_version}.2%{?dist}
+Version: 3.2
+Release: 2_ga8c3e3e_open.2%{?dist}
 License: BSD or GPLv2
 ExclusiveArch: x86_64
 Group: System Environment/Libraries
-# For information on OpenFabrics Alliance, which this package is a member of
-URL: https://www.openfabrics.org/
-# The upstream git repo
-# git://github.com/01org/psm
-# The exact hash we used to create our local tarball
-# 604758e76dc31e68d1de736ccf5ddf16cb22355b
-Source0: %{name}-%{version}-%{git_version}.tar.gz
+URL: http://www.openfabrics.org/downloads/infinipath-psm/infinipath-psm-3.2-2_ga8c3e3e_open.tar.gz
+Source0: infinipath-psm-3.2-2_ga8c3e3e_open.tar.gz
 Source1: ipath.rules
-Patch2: remove-executable-permissions-for-header-files.patch
-# https://gcc.gnu.org/bugzilla/show_bug.cgi?id=56977
-Patch3: disable-Werror.patch
-Patch4: 0001-Include-sysmacros.h.patch
-Patch5: 0001-Extend-buffer-for-uvalue-and-pvalue.patch
-
+Patch0: infinipath-psm-3.2-build.patch
+Patch1: infinipath-psm-warnings.patch
+Prefix: /usr
+BuildRoot: %{_tmppath}/%{name}-%{version}-%{release}-root
 Requires(post): /sbin/ldconfig
 Requires(postun): /sbin/ldconfig
-Requires: udev
-BuildRequires: gcc
-BuildRequires: libuuid-devel
-Conflicts: infinipath-libs <= %{version}-%{release}
+Requires: libuuid >= 2.17.2-3.el6
+Conflicts: infinipath-libs
 
 %package devel
 Summary: Development files for QLogic PSM
 Group: System Environment/Development
-Requires: %{name}%{?_isa} = %{version}-%{release}
+Requires: %{name} = %{version}-%{release}
 Requires(post): /sbin/ldconfig
 Requires(postun): /sbin/ldconfig
-Requires: libuuid-devel
-Conflicts: infinipath-devel <= %{version}-%{release}
+Requires: libuuid-devel >= 2.17.2-3.el6
+Conflicts: infinipath-devel
 
 %description
 The PSM Messaging API, or PSM API, is QLogic's low-level
@@ -51,21 +38,23 @@ interfaces in parallel environments.
 Development files for the libpsm_infinipath library
 
 %prep
-%setup -q -n infinipath-psm-%{version}-%{git_version}
-%patch2 -p1
-%patch3 -p1
-%patch4 -p1
-%patch5 -p1
-find libuuid -type f -not -name 'psm_uuid.[c|h]' -not -name Makefile -delete
+%setup -q -n infinipath-psm-3.2-2_ga8c3e3e_open
+%patch0 -p1 -b .build
+%patch1 -p1 -b .warnings
 
 %build
-export CFLAGS="$RPM_OPT_FLAGS"
-%make_build PSM_USE_SYS_UUID=1 %{MAKEARG} CC=gcc
+make XCFLAGS="%{optflags}"
 
 %install
-%make_install %{MAKEARG}
-install -d %{buildroot}%{_sysconfdir}/udev/rules.d
-install -m 0644 %{SOURCE1} %{buildroot}%{_sysconfdir}/udev/rules.d/60-ipath.rules
+rm -rf $RPM_BUILD_ROOT
+mkdir -p $RPM_BUILD_ROOT
+export DESTDIR=$RPM_BUILD_ROOT
+make install
+mkdir -p $RPM_BUILD_ROOT%{_sysconfdir}/udev/rules.d
+cp %{SOURCE1} $RPM_BUILD_ROOT%{_sysconfdir}/udev/rules.d/60-ipath.rules
+
+%clean
+rm -rf $RPM_BUILD_ROOT
 
 %post -p /sbin/ldconfig
 %postun -p /sbin/ldconfig
@@ -73,49 +62,20 @@ install -m 0644 %{SOURCE1} %{buildroot}%{_sysconfdir}/udev/rules.d/60-ipath.rule
 %postun devel -p /sbin/ldconfig
 
 %files
+%defattr(-,root,root,-)
 %{_sysconfdir}/udev/rules.d/60-ipath.rules
 %{_libdir}/libpsm_infinipath.so.*
 %{_libdir}/libinfinipath.so.*
-%license COPYING
-%doc README
 
 %files devel
+%defattr(-,root,root,-)
 %{_libdir}/libpsm_infinipath.so
 %{_libdir}/libinfinipath.so
 %{_includedir}/psm.h
 %{_includedir}/psm_mq.h
 
+
 %changelog
-* Tue Jan  9 2018 Honggang Li <honli@redhat.com> - 3.3-26_g604758e_open.2
-- No longer obsoletes libpsm2-compat
-- Resolves: bz1531317
-
-* Fri Oct  6 2017 Honggang Li <honli@redhat.com> - 3.3-26_g604758e_open.1
-- Rebase to latest upstream release.
-- Resolves: bz1451813
-
-* Mon Feb 27 2017 Honggang Li <honli@redhat.com> - 3.3-25_g326b95a_open.1
-- Rebase to latest upstream release.
-- Resolves: bz1381971
-
-* Tue May 31 2016 Honggang Li <honli@redhat.com> - 3.3-22_g4abbc60_open.2
-- Obsoletes libpsm2-compat.
-- Related: bz1272022
-
-* Thu Apr 21 2016 Honggang Li <honli@redhat.com> - 3.3-22_g4abbc60_open.1
-- Rebase to latest upstream release.
-- Link against system libuuid library.
-- Spec file cleanup.
-- Related: bz1272022
-
-* Mon Oct 27 2014 Doug Ledford <dledford@redhat.com> - 3.3-0.g6f42cdb1bb8.2
-- Fix missing FORTIFY_SOURCE setting
-- Related: bz1085255
-
-* Mon Oct 27 2014 Doug Ledford <dledford@redhat.com> - 3.3-0.g6f42cdb1bb8.1
-- Update from upstream git repo
-- Resolves: bz1085255
-
 * Mon Mar 3 2014 Jay Fenlason <fenlason@redhat.com> -3.2-2_ga8c3e3e_open.2
 - Update the -build patch and this spec file so the library is built
   with the standard optimization and security flags.

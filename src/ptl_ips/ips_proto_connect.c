@@ -301,8 +301,6 @@ ips_ipsaddr_set_req_params(struct ips_proto *proto,
 	    return PSM_INTERNAL_ERR;
 	}
 	count = paylen / (sizeof(uint64_t)+sizeof(psm_epid_t));
-	if (count > IPATH_MAX_UNIT) return PSM_INTERNAL_ERR;
-
 	memcpy(ipsaddr->epaddr->mctxt_gidhi, p, count*sizeof(uint64_t));
 	p += count*sizeof(uint64_t);
 	memcpy(ipsaddr->epaddr->mctxt_epid, p, count*sizeof(psm_epid_t));
@@ -543,6 +541,7 @@ ips_alloc_epaddr(struct ips_proto *proto, psm_epid_t epid,
     ips_epaddr_t *ipsaddr;
     uint64_t lid, context, subcontext;
     uint16_t hca_type, path_dlid;
+    uint16_t sl __unused__;
     uint16_t lmc_mask = ~((1 << proto->epinfo.ep_lmc) - 1);
     int i;
     ips_path_type_t prio;
@@ -582,10 +581,7 @@ ips_alloc_epaddr(struct ips_proto *proto, psm_epid_t epid,
     
     /* Setup base fields for remote epid before doing path record lookup:
      */
-    lid = PSMI_EPID_GET_LID(epid);
-    context = PSMI_EPID_GET_CONTEXT(epid);
-    subcontext = PSMI_EPID_GET_SUBCONTEXT(epid);
-    hca_type = PSMI_EPID_GET_HCATYPE(epid);
+    PSMI_EPID_UNPACK_EXT(epid, lid, context, subcontext, hca_type, sl);
     /* Actual context of peer */
     ipsaddr->epr.epr_context = context; 
     
@@ -593,9 +589,14 @@ ips_alloc_epaddr(struct ips_proto *proto, psm_epid_t epid,
     err = ips_init_ep_qp_and_pkt_context(hca_type, proto->epinfo.ep_baseqp,
 					 context, ipsaddr);
     if (err != PSM_OK) {
+	uint64_t llid __unused__;
+	uint64_t lsl __unused__;
+	uint64_t lcontext __unused__;
+	uint64_t lsubcontext __unused__;
 	_IPATH_ERROR("Connect: Warning! unknown HCA type %d. Assuming remote HCA is same as local.\n", hca_type);
+	PSMI_EPID_UNPACK_EXT(proto->ep->epid, llid, lcontext, lsubcontext, hca_type, lsl);
         ips_init_ep_qp_and_pkt_context(hca_type, proto->epinfo.ep_baseqp,
-                          PSMI_EPID_GET_CONTEXT(proto->ep->epid), ipsaddr);
+                                       context, ipsaddr);
     }
 
     /* Subcontext */
@@ -710,16 +711,14 @@ static psm_error_t ips_get_addr_from_epid(struct ips_proto *proto,
   psm_error_t err;
   uint64_t lid, context, subcontext;
   uint16_t hca_type, path_dlid;
+  uint16_t sl __unused__;
   psm_epid_t path_epid;
   psm_epaddr_t ep_address = NULL;
   uint16_t lmc_mask = ~((1 << proto->epinfo.ep_lmc) - 1);
   ips_epaddr_t ipsaddr;
   
   /* First unpack to get slid/dlid. */
-  lid = PSMI_EPID_GET_LID(epid);
-  context = PSMI_EPID_GET_CONTEXT(epid);
-  subcontext = PSMI_EPID_GET_SUBCONTEXT(epid);
-  hca_type = PSMI_EPID_GET_HCATYPE(epid);
+  PSMI_EPID_UNPACK_EXT(epid, lid, context, subcontext, hca_type, sl);
   
   /* Get path record for <service, slid, dlid> tuple */
   err = proto->ibta.get_path_rec(proto, proto->epinfo.ep_base_lid, 
@@ -773,7 +772,7 @@ ips_proto_process_connect(struct ips_proto *proto, psm_epid_t epid,
     
     /* If the sender doesn't have the same header/eager cutoff, we need to make
      * sure we copy the connect data into a contiguous buffer */
-    char buf[IPS_MAX_CONNECT_PAYLEN] PSMI_CACHEALIGN;
+    char buf[IPS_MAX_CONNECT_PAYLEN];
     
     hdrq_extra = uwords - p_hdr->hdr_dlen;
     if (hdrq_extra != 0) {
@@ -783,15 +782,15 @@ ips_proto_process_connect(struct ips_proto *proto, psm_epid_t epid,
 		    hdrq_extra, uwords, p_hdr->hdr_dlen);
 	int hdrq_extra = uwords - p_hdr->hdr_dlen;
 	if (hdrq_extra > 0) { /* some of it went into our hdrq */
-	    psmi_mq_mtucpy(bufp, &p_hdr->data[0].u32w0 + p_hdr->hdr_dlen, 
-			   hdrq_extra<<2);
-	    psmi_mq_mtucpy(bufp+hdrq_extra, payload, paylen);
+	    ipath_dwordcpy(bufp, &p_hdr->data[0].u32w0 + p_hdr->hdr_dlen, 
+			   hdrq_extra);
+	    ipath_dwordcpy(bufp+hdrq_extra, payload, paylen >> 2);
 	    paylen += (hdrq_extra<<2);
 	}
 	else { /* we got some useless padding in eager */
 	    hdrq_extra = -hdrq_extra;
 	    paylen -= (hdrq_extra<<2);
-	    psmi_mq_mtucpy(bufp, payp + hdrq_extra, paylen);
+	    ipath_dwordcpy(bufp, payp + hdrq_extra, paylen>>2);
 	}
 	payload = buf;
     }
@@ -803,9 +802,7 @@ ips_proto_process_connect(struct ips_proto *proto, psm_epid_t epid,
     }
     
     /* Obtain HCA type and SL from request and regenerate epid */
-    lid = PSMI_EPID_GET_LID(epid);
-    context = PSMI_EPID_GET_CONTEXT(epid);
-    subcontext = PSMI_EPID_GET_SUBCONTEXT(epid);
+    PSMI_EPID_UNPACK(epid, lid, context, subcontext);
     epid = PSMI_EPID_PACK_EXT(lid & lmc_mask, context, subcontext, hdr->hca_type, hdr->sl);
 
     /* Don't need to call ips_get_addr_from_epid as the epid cache is keyed
@@ -822,9 +819,7 @@ ips_proto_process_connect(struct ips_proto *proto, psm_epid_t epid,
     {
 	uint64_t lid, context, subcontext;
 	char *type = opcode == OPCODE_CONNECT_REQUEST ? "request" : "reply";
-	lid = PSMI_EPID_GET_LID(epid);
-	context = PSMI_EPID_GET_CONTEXT(epid);
-	subcontext = PSMI_EPID_GET_SUBCONTEXT(epid);
+	PSMI_EPID_UNPACK(epid, lid, context, subcontext);
 	psmi_syslog(proto->ep, 1, LOG_INFO,
 	    "Unrecognized connect %s (size is %d instead of %d) "
 	    "from epid %ld:%ld:%ld\n", type, paylen, 
@@ -844,12 +839,10 @@ ips_proto_process_connect(struct ips_proto *proto, psm_epid_t epid,
 	    if (!ipsaddr || req->runid_key != proto->runid_key) {
 		uint64_t lid, context, subcontext;
 
-		lid = PSMI_EPID_GET_LID(epid);
-		context = PSMI_EPID_GET_CONTEXT(epid);
-		subcontext = PSMI_EPID_GET_SUBCONTEXT(epid);
-		_IPATH_PRDBG("Unknown connectrep (ipsaddr=%p, %d,%d) "
-			"from epid %ld:%ld:%ld bad_uuid=%s\n",
+		PSMI_EPID_UNPACK(epid, lid, context, subcontext);
+		_IPATH_PRDBG("Unknown connectrep (ipsaddr=%p, %d,%d) from epid %ld:%ld:%ld bad_uuid=%s\n",
 			ipsaddr, req->runid_key, proto->runid_key,
+
 			(long) lid, (long) context, (long) subcontext,
 			uuid_valid ? "NO" : "YES");
 		break;
@@ -934,9 +927,7 @@ ips_proto_process_connect(struct ips_proto *proto, psm_epid_t epid,
 		if (!uuid_valid) {
 		    uint64_t lid, context, subcontext;
 
-		    lid = PSMI_EPID_GET_LID(epid);
-		    context = PSMI_EPID_GET_CONTEXT(epid);
-		    subcontext = PSMI_EPID_GET_SUBCONTEXT(epid);
+		    PSMI_EPID_UNPACK(epid, lid, context, subcontext);
 		    _IPATH_VDBG("Unknown disconnect request from epid %d:%d.%d "
 			"bad_uuid=%s\n", (int) lid, 
 			(int) context, (int) subcontext, uuid_valid ? "NO" : "YES");
@@ -957,9 +948,7 @@ ips_proto_process_connect(struct ips_proto *proto, psm_epid_t epid,
 	case OPCODE_DISCONNECT_REPLY:
 	    if (!ipsaddr || !uuid_valid) {
 		uint64_t lid, context, subcontext;
-		lid = PSMI_EPID_GET_LID(epid);
-		context = PSMI_EPID_GET_CONTEXT(epid);
-		subcontext = PSMI_EPID_GET_SUBCONTEXT(epid);
+		PSMI_EPID_UNPACK(epid, lid, context, subcontext);
 		_IPATH_VDBG("Unknown disconnect reply from epid %d:%d.%d bad_uuid=%s\n",
 			(int) lid, (int) context, (int) subcontext,
 			uuid_valid ? "NO" : "YES");
@@ -993,14 +982,14 @@ ptl_handle_connect_req(struct ips_proto *proto, psm_epid_t epid,
     uint16_t c_verno;
     uint16_t features;
     int newconnect = 0;
-    char buf[IPS_MAX_CONNECT_PAYLEN] PSMI_CACHEALIGN;
+    char buf[IPS_MAX_CONNECT_PAYLEN];
 
     if (epid == proto->ep->epid) {
 	/* For 2.0, we won't expose handling for this error */
 	psmi_handle_error(PSMI_EP_NORETURN, PSM_EPID_NETWORK_ERROR,
 		"Network connectivity problem: Locally detected duplicate "
 		"LIDs 0x%04x on hosts %s and %s. (Exiting)",
-		(uint32_t) psm_epid_nid(epid),
+		(uint32_t) psm_epid_nid(epaddr->epid),
 		psmi_epaddr_get_hostname(epid),
 		psmi_gethostname());
 	/* XXX no return */
@@ -1137,7 +1126,7 @@ ips_proto_connect(struct ips_proto *proto, int numep,
     psm_epaddr_t epaddr;
     ips_epaddr_t *ipsaddr = NULL;
     int numep_toconnect = 0, numep_left;
-    char buf[IPS_MAX_CONNECT_PAYLEN] PSMI_CACHEALIGN;
+    char buf[IPS_MAX_CONNECT_PAYLEN];
     union psmi_envvar_val credits_intval;
     int connect_credits;
 
@@ -1181,9 +1170,7 @@ ips_proto_connect(struct ips_proto *proto, int numep,
     for (i = 0; i < numep; i++) {
 	uint64_t lid, context, subcontext;
 
-	lid = PSMI_EPID_GET_LID(array_of_epid[i]);
-	context = PSMI_EPID_GET_CONTEXT(array_of_epid[i]);
-	subcontext = PSMI_EPID_GET_SUBCONTEXT(array_of_epid[i]);
+	PSMI_EPID_UNPACK(array_of_epid[i], lid, context, subcontext);
 	_IPATH_VDBG("epid-connect=%s connect to %ld:%ld:%ld\n", 
 			array_of_epid_mask[i] ? "YES" : " NO",
 			(long) lid, (long) context, (long) subcontext);
@@ -1223,7 +1210,7 @@ ips_proto_connect(struct ips_proto *proto, int numep,
 	    ipsaddr->epr.epr_commidx_from = idx;
 	    ipsaddr->cstate_from = CSTATE_NONE;
 	} else if (epaddr->ptladdr->cstate_to != CSTATE_NONE) { /* already connected */
-	    psmi_assert_always(epaddr->ptladdr->cstate_to == CSTATE_ESTABLISHED);
+	    psmi_assert_always(ipsaddr->cstate_to == CSTATE_ESTABLISHED);
 	    array_of_errors[i] = PSM_EPID_ALREADY_CONNECTED;
 	    array_of_epaddr[i] = epaddr;
 	    continue;
@@ -1420,7 +1407,7 @@ ips_proto_disconnect(struct ips_proto *proto, int force, int numep,
     int has_pending;
     uint64_t timeout;
     psm_error_t err = PSM_OK;
-    char buf[IPS_MAX_CONNECT_PAYLEN] PSMI_CACHEALIGN;
+    char buf[IPS_MAX_CONNECT_PAYLEN];
     uint64_t reqs_sent = 0;
     union psmi_envvar_val credits_intval;
     int disconnect_credits;

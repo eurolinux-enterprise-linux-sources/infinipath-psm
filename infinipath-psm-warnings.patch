@@ -1,0 +1,726 @@
+--- infinipath-psm-3.2-2_ga8c3e3e_open/ipath/ipath_syslog.c.orig	2014-01-13 16:46:22.366589348 -0500
++++ infinipath-psm-3.2-2_ga8c3e3e_open/ipath/ipath_syslog.c	2014-01-13 16:47:46.432093169 -0500
+@@ -50,7 +50,7 @@ ipath_vsyslog(const char *prefix, int to
+ 	     const char *format, va_list ap)
+ {
+     char logprefix[SYSLOG_MAXLEN];
+-    size_t len;
++    int len;
+ 
+     if (to_console) {
+ 	char hostname[80];
+@@ -75,6 +75,8 @@ ipath_vsyslog(const char *prefix, int to
+ 	  "(ipath/%s)[%d]: %s", prefix ? prefix : "ipath", (int) getpid(),
+ 	  format);
+ 
++    if (len >= sizeof(logprefix))
++	logprefix[SYSLOG_MAXLEN-1] = '!';
+     vsyslog(level | LOG_USER, logprefix, ap);
+ 
+     return;
+--- infinipath-psm-3.2-2_ga8c3e3e_open/include/ipath_user.h.orig	2014-01-13 16:21:53.485286584 -0500
++++ infinipath-psm-3.2-2_ga8c3e3e_open/include/ipath_user.h	2014-01-13 16:24:19.204449792 -0500
+@@ -65,15 +65,13 @@
+ // interval timing routines
+ // Convert a count of cycles to elapsed nanoseconds
+ // this is only accurate for reasonably large numbers of cycles (at least tens)
+-static __inline__ uint64_t cycles_to_nanosecs(uint64_t)
+-    __attribute__ ((always_inline));
++static __inline__ uint64_t cycles_to_nanosecs(uint64_t);
+ // convert elapsed nanoseconds to elapsed cycles
+ // this is only accurate for reasonably large numbers of nsecs (at least tens)
+-static __inline__ uint64_t nanosecs_to_cycles(uint64_t)
+-    __attribute__ ((always_inline));
++static __inline__ uint64_t nanosecs_to_cycles(uint64_t);
+ // get current count of nanoseconds from unspecified base value (only useful for
+ // intervals)
+-static __inline__ uint64_t get_nanoseconds() __attribute__ ((always_inline));
++static __inline__ uint64_t get_nanoseconds();
+ 
+ // This block will eventually move to a separate file, but for now we'll leave
+ // it here.
+@@ -224,8 +222,7 @@ int ipath_sdma_complete(struct _ipath_ct
+ int ipath_poll_type(struct _ipath_ctrl *ctrl, uint16_t poll_type);
+ 
+ static int32_t __inline__ ipath_free_tid(struct _ipath_ctrl *,
+-					 uint32_t, uint64_t)
+-    __attribute__ ((always_inline));
++					 uint32_t, uint64_t);
+ 
+ // check the unit status, and return an IPS_RC_* code if it is not in a
+ // usable state.   It will also print a message if not in a usable state
+--- infinipath-psm-3.2-2_ga8c3e3e_open/include/ipath_intf.h.orig	2014-01-13 16:21:03.690180332 -0500
++++ infinipath-psm-3.2-2_ga8c3e3e_open/include/ipath_intf.h	2014-01-13 16:21:42.186805534 -0500
+@@ -42,7 +42,7 @@
+ #ifdef __inline__
+ #undef __inline__
+ #endif
+-#define __inline__ __attribute__((always_inline,unused))
++#define __inline__ __attribute__((unused))
+ 
+ #include "sysdep.h"
+ #include "bit_ops.h"
+--- infinipath-psm-3.2-2_ga8c3e3e_open/include/ipath_byteorder.h.orig	2014-01-13 16:20:04.552681556 -0500
++++ infinipath-psm-3.2-2_ga8c3e3e_open/include/ipath_byteorder.h	2014-01-13 16:20:49.241579854 -0500
+@@ -52,9 +52,9 @@ typedef __u32 __be32;
+ typedef __u64 __le64;
+ typedef __u64 __be64;
+ 
+-static __inline__ __u16 __ipath_fswab16(__u16) __attribute__ ((always_inline));
+-static __inline__ __u32 __ipath_fswab32(__u32) __attribute__ ((always_inline));
+-static __inline__ __u64 __ipath_fswab64(__u64) __attribute__ ((always_inline));
++static __inline__ __u16 __ipath_fswab16(__u16);
++static __inline__ __u32 __ipath_fswab32(__u32);
++static __inline__ __u64 __ipath_fswab64(__u64);
+ 
+ static __inline__ __u16 __ipath_fswab16(__u16 x)
+ {
+@@ -82,21 +82,21 @@ static __inline__ __u64 __ipath_fswab64(
+ 		| ((x & (__u64)0xff00000000000000ULL) >> 56);
+ }
+ 
+-static __inline__ __u16 __cpu_to_le16(__le16) __attribute__ ((always_inline));
+-static __inline__ __u32 __cpu_to_le32(__le32) __attribute__ ((always_inline));
+-static __inline__ __u64 __cpu_to_le64(__le64) __attribute__ ((always_inline));
+-
+-static __inline__ __u16 __le16_to_cpu(__le16) __attribute__ ((always_inline));
+-static __inline__ __u32 __le32_to_cpu(__le32) __attribute__ ((always_inline));
+-static __inline__ __u64 __le64_to_cpu(__le64) __attribute__ ((always_inline));
+-
+-static __inline__ __u16 __cpu_to_be16(__be16) __attribute__ ((always_inline));
+-static __inline__ __u32 __cpu_to_be32(__be32) __attribute__ ((always_inline));
+-static __inline__ __u64 __cpu_to_be64(__be64) __attribute__ ((always_inline));
+-
+-static __inline__ __u16 __be16_to_cpu(__be16) __attribute__ ((always_inline));
+-static __inline__ __u32 __be32_to_cpu(__be32) __attribute__ ((always_inline));
+-static __inline__ __u64 __be64_to_cpu(__be64) __attribute__ ((always_inline));
++static __inline__ __u16 __cpu_to_le16(__le16);
++static __inline__ __u32 __cpu_to_le32(__le32);
++static __inline__ __u64 __cpu_to_le64(__le64);
++
++static __inline__ __u16 __le16_to_cpu(__le16);
++static __inline__ __u32 __le32_to_cpu(__le32);
++static __inline__ __u64 __le64_to_cpu(__le64);
++
++static __inline__ __u16 __cpu_to_be16(__be16);
++static __inline__ __u32 __cpu_to_be32(__be32);
++static __inline__ __u64 __cpu_to_be64(__be64);
++
++static __inline__ __u16 __be16_to_cpu(__be16);
++static __inline__ __u32 __be32_to_cpu(__be32);
++static __inline__ __u64 __be64_to_cpu(__be64);
+ 
+ #if __BYTE_ORDER == __LITTLE_ENDIAN
+ 
+--- infinipath-psm-3.2-2_ga8c3e3e_open/psm_am_internal.h.orig	2014-01-13 16:49:08.755530339 -0500
++++ infinipath-psm-3.2-2_ga8c3e3e_open/psm_am_internal.h	2014-01-13 16:49:28.120338358 -0500
+@@ -50,7 +50,7 @@ struct psmi_am_token {
+   /* PTLs may add other stuff here */
+ };
+ 
+-PSMI_ALWAYS_INLINE(
++PSMI_INLINE(
+ psm_am_handler_fn_t
+ psm_am_get_handler_function(psm_ep_t ep, psm_handler_t handler_idx))
+ {
+--- infinipath-psm-3.2-2_ga8c3e3e_open/ipath/ipath_write_pio-x86_64.c.orig	2014-01-13 17:16:34.012038038 -0500
++++ infinipath-psm-3.2-2_ga8c3e3e_open/ipath/ipath_write_pio-x86_64.c	2014-01-13 17:16:38.398216308 -0500
+@@ -198,11 +198,6 @@ void ipath_write_pio(volatile uint32_t *
+  */
+ static void 
+ ipath_write_pio_special_trigger(volatile uint32_t *piob,
+-	const struct ipath_pio_params *pioparm, void *hdr, void *bdata,
+-	unsigned offset) __attribute__ ((always_inline));
+-
+-static void 
+-ipath_write_pio_special_trigger(volatile uint32_t *piob,
+ 		const struct ipath_pio_params *pioparm,
+ 		void *hdr, void *bdata, unsigned offset)
+ {
+--- infinipath-psm-3.2-2_ga8c3e3e_open/psm_lock.h.orig	2014-01-13 17:29:10.660409349 -0500
++++ infinipath-psm-3.2-2_ga8c3e3e_open/psm_lock.h	2014-01-13 17:29:24.691990194 -0500
+@@ -58,14 +58,14 @@
+   #define PSMI_SPIN_LOCKED    1
+   #define PSMI_SPIN_UNLOCKED  0
+ 
+-  PSMI_ALWAYS_INLINE(
++  PSMI_INLINE(
+   int 
+   psmi_spin_init(psmi_spinlock_t *lock)) {
+     ips_atomic_set(lock, PSMI_SPIN_UNLOCKED);
+     return 0;
+   }
+ 
+-  PSMI_ALWAYS_INLINE(
++  PSMI_INLINE(
+   int
+   psmi_spin_trylock(psmi_spinlock_t *lock)) {
+     if (ips_atomic_cmpxchg(lock,PSMI_SPIN_UNLOCKED,PSMI_SPIN_LOCKED) 
+@@ -75,7 +75,7 @@
+ 	return EBUSY;
+   }
+ 
+-  PSMI_ALWAYS_INLINE(
++  PSMI_INLINE(
+   int
+   psmi_spin_lock(psmi_spinlock_t *lock)) {
+     while (psmi_spin_trylock(lock) == EBUSY)
+@@ -83,7 +83,7 @@
+     return 0;
+   }
+ 
+-  PSMI_ALWAYS_INLINE(
++  PSMI_INLINE(
+   int
+   psmi_spin_unlock(psmi_spinlock_t *lock)) {
+     atomic_set(lock, PSMI_SPIN_UNLOCKED);
+--- infinipath-psm-3.2-2_ga8c3e3e_open/psm_help.h.warnings	2014-01-08 16:33:35.000000000 -0500
++++ infinipath-psm-3.2-2_ga8c3e3e_open/psm_help.h	2014-01-13 17:30:36.518960670 -0500
+@@ -38,10 +38,6 @@
+ #define PSMI_INLINE(FN)					\
+     static inline FN
+ 
+-#define PSMI_ALWAYS_INLINE(FN)                            \
+-    static __inline__ FN __attribute__((always_inline));  \
+-    static __inline__ FN
+-
+ #define PSMI_NEVER_INLINE(FN)             \
+     static FN __attribute__((noinline));  \
+     static FN
+@@ -90,7 +86,7 @@
+ #define PSMI_CACHEALIGN	__attribute__((aligned(64)))
+ 
+ /* Easy way to ignore the OK_NO_PROGRESS case */
+-PSMI_ALWAYS_INLINE(
++PSMI_INLINE(
+ psm_error_t
+ psmi_err_only(psm_error_t err))
+ {
+--- infinipath-psm-3.2-2_ga8c3e3e_open/psm_mq_internal.h.orig	2014-01-14 00:47:07.053157080 -0500
++++ infinipath-psm-3.2-2_ga8c3e3e_open/psm_mq_internal.h	2014-01-14 00:47:40.142525484 -0500
+@@ -222,7 +222,7 @@ void psmi_mq_mtucpy_safe(void *vdest, co
+ /*
+  * Optimize for 0-8 byte case, but also handle others.
+  */
+-PSMI_ALWAYS_INLINE(
++PSMI_INLINE(
+ void mq_copy_tiny(uint32_t* dest, uint32_t* src, uint8_t len)
+ )
+ {
+@@ -256,7 +256,7 @@ void mq_copy_tiny(uint32_t* dest, uint32
+  *
+  * The function sets status truncation errors. Basically what MPI_Status.
+  */
+-PSMI_ALWAYS_INLINE(
++PSMI_INLINE(
+ void mq_status_copy(psm_mq_req_t req, psm_mq_status_t *status))
+ {
+     status->msg_tag    = req->tag;
+@@ -266,7 +266,7 @@ void mq_status_copy(psm_mq_req_t req, ps
+     status->context    = req->context;
+ }
+ 
+-PSMI_ALWAYS_INLINE(
++PSMI_INLINE(
+ uint32_t mq_set_msglen(psm_mq_req_t req, uint32_t recvlen, uint32_t sendlen))
+ {
+     req->send_msglen = sendlen;
+@@ -284,7 +284,7 @@ uint32_t mq_set_msglen(psm_mq_req_t req,
+ 
+ #ifndef PSM_DEBUG
+ 
+-PSMI_ALWAYS_INLINE(
++PSMI_INLINE(
+ void
+ mq_qq_append(struct mqq *q, psm_mq_req_t req))
+ {
+@@ -304,7 +304,7 @@ mq_qq_append(struct mqq *q, psm_mq_req_t
+ } while (0)
+ #endif
+ 
+-PSMI_ALWAYS_INLINE(
++PSMI_INLINE(
+ void
+ mq_sq_append(struct mqsq *q, psm_mq_req_t req))
+ {
+@@ -313,7 +313,7 @@ mq_sq_append(struct mqsq *q, psm_mq_req_
+     q->lastp = &req->next;
+ }
+ 
+-PSMI_ALWAYS_INLINE(
++PSMI_INLINE(
+ void
+ mq_qq_remove(struct mqq *q, psm_mq_req_t req))
+ {
+@@ -377,7 +377,7 @@ void psmi_mq_handle_rts_complete(psm_mq_
+ 
+ void psmi_mq_stats_register(psm_mq_t mq, mpspawn_stats_add_fn add_fn);
+ 
+-PSMI_ALWAYS_INLINE(
++PSMI_INLINE(
+ psm_mq_req_t 
+ mq_req_match(struct mqsq *q, uint64_t tag, int remove)
+ )
+@@ -398,7 +398,7 @@ mq_req_match(struct mqsq *q, uint64_t ta
+     return NULL; /* no match */
+ }
+ 
+-PSMI_ALWAYS_INLINE(
++PSMI_INLINE(
+ psm_mq_req_t 
+ mq_ooo_match(struct mqsq *q, uint16_t msg_seqnum)
+ )
+@@ -431,7 +431,7 @@ psmi_mq_register_unexpected_callback(psm
+ 				     psm_mq_unexpected_callback_fn_t fn);
+ 
+ 
+-PSMI_ALWAYS_INLINE(
++PSMI_INLINE(
+ int 
+ psmi_mq_handle_tiny_envelope(psm_mq_t mq, psm_epaddr_t epaddr,
+ 			     uint64_t tag, const void *payload, uint32_t tinylen))
+@@ -463,7 +463,7 @@ psmi_mq_handle_tiny_envelope(psm_mq_t mq
+     return rc;
+ }
+ 
+-PSMI_ALWAYS_INLINE(
++PSMI_INLINE(
+ void
+ psmi_mq_stats_rts_account(psm_mq_req_t req))
+ {
+--- infinipath-psm-3.2-2_ga8c3e3e_open/ptl_am/am_reqrep_shmem.c.orig	2014-01-14 00:48:48.547344025 -0500
++++ infinipath-psm-3.2-2_ga8c3e3e_open/ptl_am/am_reqrep_shmem.c	2014-01-14 00:49:22.571755658 -0500
+@@ -1332,7 +1332,7 @@ amsh_ep_disconnect(ptl_t *ptl, int force
+ }
+ 
+ #undef CSWAP
+-PSMI_ALWAYS_INLINE(
++PSMI_INLINE(
+ int32_t 
+ cswap(volatile int32_t *p, int32_t old_value, int32_t new_value))
+ {
+@@ -1343,7 +1343,7 @@ cswap(volatile int32_t *p, int32_t old_v
+   return old_value;
+ }
+ 
+-PSMI_ALWAYS_INLINE(
++PSMI_INLINE(
+ am_pkt_short_t *
+ am_ctl_getslot_pkt_inner(volatile am_ctl_qhdr_t *shq, am_pkt_short_t *pkt0)
+ )
+@@ -1382,7 +1382,7 @@ am_ctl_getslot_pkt_inner(volatile am_ctl
+ #define am_ctl_getslot_bulkpkt_inner(shq,pkt0) ((am_pkt_bulk_t *) \
+             am_ctl_getslot_pkt_inner(shq,(am_pkt_short_t *)(pkt0)))
+ 
+-PSMI_ALWAYS_INLINE(
++PSMI_INLINE(
+ am_pkt_short_t *
+ am_ctl_getslot_pkt(ptl_t *ptl, int shmidx, int is_reply)
+ )
+@@ -1400,7 +1400,7 @@ am_ctl_getslot_pkt(ptl_t *ptl, int shmid
+     return am_ctl_getslot_pkt_inner(shq, pkt0);
+ }
+ 
+-PSMI_ALWAYS_INLINE(
++PSMI_INLINE(
+ am_pkt_bulk_t *
+ am_ctl_getslot_med(ptl_t *ptl, int shmidx, int is_reply)
+ )
+@@ -1418,7 +1418,7 @@ am_ctl_getslot_med(ptl_t *ptl, int shmid
+     return am_ctl_getslot_bulkpkt_inner(shq, pkt0);
+ }
+ 
+-PSMI_ALWAYS_INLINE(
++PSMI_INLINE(
+ am_pkt_bulk_t *
+ am_ctl_getslot_long(ptl_t *ptl, int shmidx, int is_reply)
+ )
+@@ -1436,7 +1436,7 @@ am_ctl_getslot_long(ptl_t *ptl, int shmi
+     return am_ctl_getslot_bulkpkt_inner(shq, pkt0);
+ }
+ 
+-PSMI_ALWAYS_INLINE(
++PSMI_INLINE(
+ am_pkt_bulk_t *
+ am_ctl_getslot_huge(ptl_t *ptl, int shmidx, int is_reply)
+ )
+@@ -1464,7 +1464,7 @@ psmi_handlertab_t psmi_allhandlers[] = {
+     { psmi_am_handler }
+ };
+ 
+-PSMI_ALWAYS_INLINE(
++PSMI_INLINE(
+ void 
+ advance_head(volatile am_ctl_qshort_cache_t *hdr))
+ {
+@@ -1481,7 +1481,7 @@ advance_head(volatile am_ctl_qshort_cach
+  * a cached copy of the integer value of the tail and compare it against the
+  * previous one we saw.
+  */
+-PSMI_ALWAYS_INLINE(
++PSMI_INLINE(
+ psm_error_t
+ amsh_poll_internal_inner(ptl_t *ptl, int replyonly, int is_internal))
+ {
+@@ -1563,7 +1563,7 @@ amsh_poll(ptl_t *ptl, int replyonly)
+     return amsh_poll_internal_inner(ptl, replyonly, 0);
+ }
+ 
+-PSMI_ALWAYS_INLINE(
++PSMI_INLINE(
+ void
+ am_send_pkt_short(ptl_t *ptl, uint32_t destidx, uint32_t bulkidx, 
+                   uint16_t fmt, uint16_t nargs, uint16_t handleridx, 
+@@ -1605,7 +1605,7 @@ static char amsh_medscratch[AMMED_SZ];
+ #define amsh_shm_copy_long  psmi_mq_mtucpy
+ #define amsh_shm_copy_huge  psmi_memcpyo
+ 
+-PSMI_ALWAYS_INLINE(
++PSMI_INLINE(
+ int
+ psmi_amsh_generic_inner(uint32_t amtype, ptl_t *ptl, psm_epaddr_t epaddr,
+                   psm_handler_t handler, psm_amarg_t *args, int nargs,
+@@ -2031,7 +2031,7 @@ amsh_mq_rndv(ptl_t *ptl, psm_mq_t mq, ps
+ /*
+  * All shared am mq sends, req can be NULL
+  */
+-PSMI_ALWAYS_INLINE(
++PSMI_INLINE(
+ psm_error_t
+ amsh_mq_send_inner(psm_mq_t mq, psm_mq_req_t req, psm_epaddr_t epaddr, 
+                    uint32_t flags, uint64_t tag, const void *ubuf, uint32_t len))
+--- infinipath-psm-3.2-2_ga8c3e3e_open/psm_utils.c.orig	2014-01-14 00:50:12.362802173 -0500
++++ infinipath-psm-3.2-2_ga8c3e3e_open/psm_utils.c	2014-01-14 00:50:27.801484618 -0500
+@@ -121,7 +121,7 @@ psmi_epid_fini()
+     return PSM_OK;
+ }
+ 
+-PSMI_ALWAYS_INLINE(
++PSMI_INLINE(
+ uint64_t
+ hash_this(const psm_ep_t ep, const psm_epid_t epid))
+ {
+@@ -132,7 +132,7 @@ hash_this(const psm_ep_t ep, const psm_e
+     return hash;
+ }
+ 
+-PSMI_ALWAYS_INLINE(
++PSMI_INLINE(
+ void *
+ psmi_epid_lookup_inner(psm_ep_t ep, psm_epid_t epid, int remove))
+ {
+@@ -1138,7 +1138,7 @@ psmi_free_internal(void *ptr)
+     free(ptr);
+ }
+ 
+-PSMI_ALWAYS_INLINE(
++PSMI_INLINE(
+ psm_error_t
+ psmi_coreopt_ctl(const void *core_obj, int optname, 
+ 		 void *optval, uint64_t *optlen, int get))
+@@ -1213,7 +1213,7 @@ psm_error_t psmi_core_getopt(const void
+ }
+ 
+ /* PSM AM component option handling */
+-PSMI_ALWAYS_INLINE(
++PSMI_INLINE(
+ psm_error_t
+ psmi_amopt_ctl(const void *am_obj, int optname, 
+ 	       void *optval, uint64_t *optlen, int get))
+--- infinipath-psm-3.2-2_ga8c3e3e_open/psm_mq.c.orig	2014-01-14 00:51:39.951441362 -0500
++++ infinipath-psm-3.2-2_ga8c3e3e_open/psm_mq.c	2014-01-14 00:51:53.693994433 -0500
+@@ -68,7 +68,7 @@ mq_req_match_with_tagsel(psm_mq_t mq, st
+ 
+ #if 0
+ /* Only for psm_mq_irecv. Currently not enabled. */
+-PSMI_ALWAYS_INLINE(
++PSMI_INLINE(
+ psm_mq_req_t
+ mq_req_match_with_tagsel_inline(struct mqsq *q, uint64_t tag, uint64_t tagsel))
+ {
+@@ -242,7 +242,7 @@ PSMI_API_DECL(psm_mq_cancel)
+  * execution environment is (threads, oversubscribing processes, etc).
+  *
+  */
+-PSMI_ALWAYS_INLINE(
++PSMI_INLINE(
+ psm_error_t 
+ psmi_mq_wait_inner(psm_mq_req_t *ireq, psm_mq_status_t *status, int do_lock))
+ {
+--- infinipath-psm-3.2-2_ga8c3e3e_open/ptl_ips/ips_recvq.h.orig	2014-01-14 00:57:37.836200174 -0500
++++ infinipath-psm-3.2-2_ga8c3e3e_open/ptl_ips/ips_recvq.h	2014-01-14 00:57:47.070580665 -0500
+@@ -58,7 +58,7 @@ void    ips_recvq_egrbuf_table_free(void
+ /*
+  * Accessor inlines for reading and writing to hdrq/egrq registers
+  */
+-PSMI_ALWAYS_INLINE(
++PSMI_INLINE(
+ void *ips_recvq_egr_index_2_ptr(void **egrq_buftable, int index))
+ {
+     return egrq_buftable[index];
+--- infinipath-psm-3.2-2_ga8c3e3e_open/ptl_ips/ips_tidflow.h.orig	2014-01-14 00:58:43.479907463 -0500
++++ infinipath-psm-3.2-2_ga8c3e3e_open/ptl_ips/ips_tidflow.h	2014-01-14 00:59:01.966776060 -0500
+@@ -96,7 +96,7 @@ struct ips_tfctrl {
+   struct ips_tf tf[INFINIPATH_TF_NFLOWS];
+ };
+ 
+-PSMI_ALWAYS_INLINE(
++PSMI_INLINE(
+ int
+ ips_tf_available(struct ips_tfctrl *tfctrl))
+ {
+--- infinipath-psm-3.2-2_ga8c3e3e_open/ptl_ips/ips_writehdrq.h.orig	2014-01-14 00:59:36.076077482 -0500
++++ infinipath-psm-3.2-2_ga8c3e3e_open/ptl_ips/ips_writehdrq.h	2014-01-14 00:59:43.882411624 -0500
+@@ -76,7 +76,7 @@ ips_writehdrq_init(const psmi_context_t
+ psm_error_t
+ ips_writehdrq_fini(struct ips_writehdrq *writeq);
+ 
+-PSMI_ALWAYS_INLINE(
++PSMI_INLINE(
+ void
+ ips_writehdrq_write_rhf_atomic(uint32_t *rhf_dest, uint32_t *rhf_src))
+ {
+--- infinipath-psm-3.2-2_ga8c3e3e_open/ptl_ips/ips_proto_help.h.orig	2014-01-14 01:00:41.006769698 -0500
++++ infinipath-psm-3.2-2_ga8c3e3e_open/ptl_ips/ips_proto_help.h	2014-01-14 01:01:06.230807024 -0500
+@@ -45,7 +45,7 @@
+ #define IPS_TINY_PROCESS_MQTINY 1   /* whether mq processing of tiny pkts is
+ 				       done separately from non-tiny packets */
+ 
+-PSMI_ALWAYS_INLINE(
++PSMI_INLINE(
+ uint8_t
+ ips_flow_gen_ackflags(ips_scb_t *scb, struct ips_flow *flow))
+ {
+@@ -75,7 +75,7 @@ ips_flow_gen_ackflags(ips_scb_t *scb, st
+     return (uint8_t) (scb->flags & IPS_SEND_FLAG_PROTO_OPTS);
+ }
+ 
+-PSMI_ALWAYS_INLINE(
++PSMI_INLINE(
+ ptl_epaddr_flow_t ips_proto_flowid(struct ips_message_header *p_hdr))
+ {
+   psm_protocol_type_t protocol __unused__;
+@@ -87,7 +87,7 @@ ptl_epaddr_flow_t ips_proto_flowid(struc
+   return flowidx;
+ }
+ 
+-PSMI_ALWAYS_INLINE(
++PSMI_INLINE(
+ void ips_kdeth_cksum(struct ips_message_header *p_hdr))
+ {
+   /* Compute KDETH checksum */
+@@ -101,7 +101,7 @@ void ips_kdeth_cksum(struct ips_message_
+         (uint16_t) __le16_to_cpu(p_hdr->iph.pkt_flags));
+ }
+ 
+-PSMI_ALWAYS_INLINE(
++PSMI_INLINE(
+ int ips_do_cksum(struct ips_proto *proto,
+ 		 struct ips_message_header *p_hdr,
+ 		 void *payload,
+@@ -140,7 +140,7 @@ int ips_do_cksum(struct ips_proto *proto
+ }
+ 
+ /* Get pbc static rate value for flow for a given message length */
+-PSMI_ALWAYS_INLINE(
++PSMI_INLINE(
+ uint32_t ips_proto_pbc_static_rate(struct ips_flow *flow, uint32_t msgLen))
+ {
+   uint32_t rate = 0;
+@@ -204,7 +204,7 @@ uint32_t ips_proto_pbc_static_rate(struc
+ /* This is only used for SDMA cases; pbc is really a pointer to
+  * struct ips_pbc_header * or the equivalent un-named structure
+  * in ips_scb */
+-PSMI_ALWAYS_INLINE(
++PSMI_INLINE(
+ void ips_proto_pbc_update(struct ips_proto *proto, 
+ 			  struct ips_flow *flow, uint32_t isCtrlMsg,
+ 			  union ipath_pbc *pbc, uint32_t hdrlen, 
+@@ -243,7 +243,7 @@ void ips_proto_pbc_update(struct ips_pro
+ 	    (msg_hdr)->src_context_ext = (context>>4) & 0x3;	\
+ 	} while (0)
+ 
+-PSMI_ALWAYS_INLINE(
++PSMI_INLINE(
+ uint32_t ips_proto_dest_context_from_header(struct ips_proto *proto,
+ 					    struct ips_message_header *p_hdr))
+ {
+@@ -277,7 +277,7 @@ uint32_t ips_proto_dest_context_from_hea
+   return dest_context;
+ }
+ 
+-PSMI_ALWAYS_INLINE(
++PSMI_INLINE(
+ void ips_proto_hdr(ips_scb_t *scb,
+ 		   struct ips_epinfo *epinfo, 
+ 		   struct ips_epinfo_remote *epr,
+@@ -425,7 +425,7 @@ ips_scb_prepare_flow_inner(ips_scb_t *sc
+     return;
+ }
+ 
+-PSMI_ALWAYS_INLINE(
++PSMI_INLINE(
+ psm_epid_t
+ ips_epid_from_phdr(const uint16_t lmc_mask, 
+ 		   const struct ips_message_header *p_hdr))
+@@ -437,7 +437,7 @@ ips_epid_from_phdr(const uint16_t lmc_ma
+     return PSMI_EPID_PACK(lid, context, subcontext);
+ }
+ 
+-PSMI_ALWAYS_INLINE(
++PSMI_INLINE(
+ void
+ ips_epaddr_stats_send(struct ptl_epaddr *ptladdr, uint8_t msgtype))
+ {
+@@ -475,7 +475,7 @@ psm_error_t ips_proto_send_ctrl_message(
+ 					uint32_t *msg_queue_mask, 
+ 					void *payload);
+ 
+-PSMI_ALWAYS_INLINE(
++PSMI_INLINE(
+ void 
+ ips_proto_send_ack(struct ips_recvhdrq *recvq, struct ips_flow *flow))
+ {
+@@ -496,7 +496,7 @@ ips_proto_send_ack(struct ips_recvhdrq *
+   }
+ }
+ 
+-PSMI_ALWAYS_INLINE(
++PSMI_INLINE(
+ void 
+ ips_proto_send_nak(struct ips_recvhdrq *recvq, struct ips_flow *flow))
+ {
+@@ -520,7 +520,7 @@ ips_proto_send_nak(struct ips_recvhdrq *
+ /* return 1 if packet is next expected in flow
+  * return 0 if packet is not next expected in flow (and nak packet).
+  */
+-PSMI_ALWAYS_INLINE(
++PSMI_INLINE(
+ int
+ ips_proto_is_expected_or_nak(struct ips_recvhdrq_event *rcv_ev))
+ {
+@@ -594,7 +594,7 @@ ips_proto_is_expected_or_nak(struct ips_
+  *	0: out of order, no touch;
+  *	-1: out of order, buffered in outoforder queue.
+  */
+-PSMI_ALWAYS_INLINE(
++PSMI_INLINE(
+ int 
+ ips_proto_check_msg_order(psm_epaddr_t epaddr,
+ 	struct ips_flow *flow, struct ips_message_header *p_hdr))
+@@ -621,7 +621,7 @@ ips_proto_check_msg_order(psm_epaddr_t e
+ }
+ 
+ #if IPS_TINY_PROCESS_MQTINY
+-PSMI_ALWAYS_INLINE(
++PSMI_INLINE(
+ int 
+ ips_proto_process_mq_tiny(const struct ips_recvhdrq_event *rcv_ev))
+ {
+@@ -699,7 +699,7 @@ ips_proto_process_packet(const struct ip
+  * receive queue.
+  */
+ 
+-PSMI_ALWAYS_INLINE(
++PSMI_INLINE(
+ psm_error_t
+ ips_recv_progress_if_busy(ptl_t *ptl, psm_error_t err))
+ {
+@@ -712,7 +712,7 @@ ips_recv_progress_if_busy(ptl_t *ptl, ps
+ }
+ 
+ /* Find next lowest power of a two for a 32 bit number*/
+-PSMI_ALWAYS_INLINE(
++PSMI_INLINE(
+ unsigned int 
+ ips_next_low_pow2(unsigned int v))
+ {
+@@ -734,7 +734,7 @@ ips_next_low_pow2(unsigned int v))
+   return r;
+ }
+ 
+-PSMI_ALWAYS_INLINE(
++PSMI_INLINE(
+ ips_path_rec_t *ips_select_path(struct ips_proto *proto, 
+ 				ips_path_type_t path_type,
+ 				ips_epaddr_t *ipsaddr))
+--- infinipath-psm-3.2-2_ga8c3e3e_open/ptl_ips/ips_proto.c.orig	2014-01-14 01:03:08.207826726 -0500
++++ infinipath-psm-3.2-2_ga8c3e3e_open/ptl_ips/ips_proto.c	2014-01-14 01:03:19.452296542 -0500
+@@ -1491,7 +1491,7 @@ fail:
+  * The effect is as if the event was successful but dropped on the wire
+  * somewhere.
+  */
+-PSMI_ALWAYS_INLINE(
++PSMI_INLINE(
+ int
+ dma_do_fault())
+ {
+--- infinipath-psm-3.2-2_ga8c3e3e_open/ptl_ips/ipserror.c.orig	2014-01-14 01:03:54.647749217 -0500
++++ infinipath-psm-3.2-2_ga8c3e3e_open/ptl_ips/ipserror.c	2014-01-14 01:04:10.761447103 -0500
+@@ -36,7 +36,7 @@
+ #include <stdio.h>
+ #include <string.h>
+ #include <errno.h>
+-#include <ipserror.h>
++#include "ipserror.h"
+ 
+ char * ips_err_str(int ips_error)
+ {
+--- infinipath-psm-3.2-2_ga8c3e3e_open/ptl_ips/ips_recvhdrq.c.orig	2014-01-14 01:06:03.529057780 -0500
++++ infinipath-psm-3.2-2_ga8c3e3e_open/ptl_ips/ips_recvhdrq.c	2014-01-14 01:06:11.763404080 -0500
+@@ -388,7 +388,7 @@ do_pkt_cksum(struct ips_recvhdrq_event *
+   return 1;
+ }
+ 
+-PSMI_ALWAYS_INLINE(
++PSMI_INLINE(
+ void
+ process_pending_acks(struct ips_recvhdrq *recvq))
+ {
+@@ -432,7 +432,7 @@ process_pending_acks(struct ips_recvhdrq
+  */
+ 
+ #if IPS_RCVHDRQ_THRU_FUNCTION_POINTER
+-PSMI_ALWAYS_INLINE(
++PSMI_INLINE(
+ psm_error_t 
+ ips_recvhdrq_progress_inner(struct ips_recvhdrq *recvq,
+ 			    const int has_no_rtail))
+--- infinipath-psm-3.2-2_ga8c3e3e_open/ptl_ips/ips_proto_mq.c.orig	2014-01-14 01:07:32.071717918 -0500
++++ infinipath-psm-3.2-2_ga8c3e3e_open/ptl_ips/ips_proto_mq.c	2014-01-14 01:07:45.895311136 -0500
+@@ -58,7 +58,7 @@ ips_poll_scb(struct ips_proto *proto,
+     return scb;
+ }
+ 
+-PSMI_ALWAYS_INLINE(
++PSMI_INLINE(
+ ips_scb_t * 
+ mq_alloc_tiny(struct ips_proto *proto))
+ {
+@@ -70,7 +70,7 @@ mq_alloc_tiny(struct ips_proto *proto))
+        return ips_poll_scb(proto, 1, 0, 0, 1);
+ }
+ 
+-PSMI_ALWAYS_INLINE(
++PSMI_INLINE(
+ ips_scb_t * 
+ mq_alloc_pkts(struct ips_proto *proto, int npkts, int len, uint32_t flags))
+ {
+@@ -138,7 +138,7 @@ extern psm_error_t ips_ptl_poll(ptl_t *p
+  *			  rxe/txe parity error.
+  * PSM_EP_NO_NETWORK: No network, no lid, ...
+  */
+-PSMI_ALWAYS_INLINE(
++PSMI_INLINE(
+ psm_error_t
+ ips_mq_send_envelope(struct ips_proto *proto, psm_epaddr_t mepaddr,
+ 		     ips_epaddr_t *ipsaddr, struct ips_scb *scb, int do_flush))
+@@ -320,7 +320,7 @@ spio:
+ }
+ 
+ 
+-PSMI_ALWAYS_INLINE(
++PSMI_INLINE(
+ void
+ ips_shortcpy(void* vdest, const void* vsrc, uint32_t nchars)
+ )

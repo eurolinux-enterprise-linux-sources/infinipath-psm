@@ -535,9 +535,6 @@ ips_proto_fini(struct ips_proto *proto, int force, uint64_t timeout_in)
             psmi_calloc(proto->ep, UNDEFINED, num_disc, sizeof(psm_epaddr_t));
 
 	if (errs == NULL || epaddr_array == NULL || mask == NULL) {
-	    if (epaddr_array) psmi_free(epaddr_array);
-	    if (errs) psmi_free(errs);
-	    if (mask) psmi_free(mask);
 	    err = PSM_NO_MEMORY;
 	    goto fail;
 	}
@@ -598,8 +595,11 @@ ips_proto_fini(struct ips_proto *proto, int force, uint64_t timeout_in)
 	    goto fail;
     }
     else {
-	ips_scbctrl_fini(proto->scbc_rv);
-	psmi_free(proto->scbc_rv);
+	if ((err = ips_scbctrl_fini(proto->scbc_rv)))
+	    goto fail;
+	if (proto->scbc_rv != NULL) {
+	    psmi_free(proto->scbc_rv);
+	}
     }
 
     psmi_mpool_destroy(proto->pend_sends_pool);
@@ -630,11 +630,9 @@ proto_sdma_init(struct ips_proto *proto, const psmi_context_t *context)
     psmi_getenv("PSM_SDMA",
 		"ipath send dma flags (0 disables send dma)",
 		PSMI_ENVVAR_LEVEL_USER, PSMI_ENVVAR_TYPE_UINT_FLAGS,
-		(union psmi_envvar_val) defval,
-		&env_sdma);
+		(union psmi_envvar_val) defval, &env_sdma);
 
-    if(env_sdma.e_uint != 1)
-      proto->flags |= env_sdma.e_uint & IPS_PROTO_FLAGS_ALL_SDMA;
+    proto->flags |= env_sdma.e_uint & IPS_PROTO_FLAGS_ALL_SDMA;
 
     /* If anything uses send dma, figure out our max packet threshold to call
      * send dma with */
@@ -762,7 +760,7 @@ _build_ctrl_message(struct ips_proto *proto,
     uint32_t tot_paywords = sizeof(struct ips_message_header) >> 2;
     struct ips_epinfo *epinfo = &proto->epinfo;
     struct ips_epinfo_remote *epr = &ipsaddr->epr;
-    uint16_t pkt_flags = IPS_EPSTATE_COMMIDX_PACK(epr->epr_commidx_to);
+    uint16_t pkt_flags = 0;
     struct ips_message_header *p_hdr = &msg->pbc_hdr.hdr;
     ips_path_rec_t *ctrl_path = ipsaddr->epr.epr_path[IPS_PATH_HIGH_PRIORITY][ipsaddr->epr.epr_hpp_index];
     int paylen = 0;
@@ -822,11 +820,6 @@ _build_ctrl_message(struct ips_proto *proto,
 	tidrecvc = 
 	  psmi_mpool_find_obj_by_index(proto->protoexp->tid_desc_recv_pool,
 				       tid_recv_sessid);
-	if (tidrecvc == NULL) {
-	  *discard_msg = 1;
-	  ips_ptladdr_unlock(ipsaddr);
-	  break;
-	}
 	if_pf (psmi_mpool_get_obj_gen_count(tidrecvc) != args[1]._desc_genc) {
 	  *discard_msg = 1;
 	  ips_ptladdr_unlock(ipsaddr);
@@ -860,11 +853,7 @@ _build_ctrl_message(struct ips_proto *proto,
 	tidrecvc = 
 	  psmi_mpool_find_obj_by_index(proto->protoexp->tid_desc_recv_pool,
 				       tid_recv_sessid);
-	if (tidrecvc == NULL) {
-	  *discard_msg = 1;
-	  ips_ptladdr_unlock(ipsaddr);
-	  break;
-	}
+	
 	if_pf (psmi_mpool_get_obj_gen_count(tidrecvc) != args[1]._desc_genc) {
 	  *discard_msg = 1;
 	  ips_ptladdr_unlock(ipsaddr);
@@ -1005,10 +994,6 @@ _build_ctrl_message(struct ips_proto *proto,
     case OPCODE_TIDS_GRANT: 
 	paylen = ips_protoexp_build_ctrl_message(proto->protoexp, ipsaddr, 
 			p_hdr->data, &pkt_flags, message_type, payload);
-	if (paylen < 0) {
-	  *discard_msg = 1;
-	  break;
-	}
 	tot_paywords += paylen >> 2;
 	p_hdr->lrh[2] = __cpu_to_be16(tot_paywords + SIZE_OF_CRC);
     break;
@@ -1041,7 +1026,7 @@ ips_proto_send_ctrl_message(struct ips_flow *flow, uint8_t message_type,
     ptl_arg_t *args = (ptl_arg_t *) payload;
     ips_epaddr_t *ipsaddr = flow->ipsaddr;
     struct ips_proto *proto = ipsaddr->proto;
-    struct ips_ctrlq *ctrlq = &proto->ctrlq[IPS_FLOWID2INDEX(flow->flowid)&0x3];
+    struct ips_ctrlq *ctrlq = &proto->ctrlq[IPS_FLOWID2INDEX(flow->flowid)];
     struct ips_ctrlq_elem *cqe = ctrlq->ctrlq_cqe;
     uint32_t cksum = 0;
     int paylen;
@@ -1152,7 +1137,7 @@ ips_proto_timer_ctrlq_callback(struct psmi_timer *timer, uint64_t t_cyc_expire)
     psm_error_t err;
     struct ptl_epaddr *ipsaddr;
     uint32_t cksum = 0;
-    int paylen;
+    int paylen __unused__;
     uint8_t discard_msg = 0;
     
     // service ctrl send queue first
@@ -1166,7 +1151,7 @@ ips_proto_timer_ctrlq_callback(struct psmi_timer *timer, uint64_t t_cyc_expire)
 				     cqe[ctrlq->ctrlq_tail].args,
 				     &discard_msg);
 	
-	psmi_assert_always(paylen == 0);
+	psmi_assert(paylen == 0);
 
 	if_pt (!discard_msg) {
 	  /* If enabled checksum control message */
@@ -1355,7 +1340,7 @@ ips_proto_flow_flush_dma(struct ips_flow *flow, int *nflushed)
 {
     struct ips_proto *proto = flow->ipsaddr->proto;
     struct ips_scb_pendlist *scb_pend = &flow->scb_pend;
-    uint32_t cntr_init;
+    uint32_t cntr_init __unused__;
     ips_scb_t *scb;
     psm_error_t err = PSM_OK;
     int howmany = 0;
@@ -1396,7 +1381,7 @@ ips_proto_flow_flush_dma(struct ips_flow *flow, int *nflushed)
 	goto fail;
 
     /* scb_dma_send shouldn't modify iovec_cntr_next_inflight */
-    psmi_assert_always(cntr_init == proto->iovec_cntr_next_inflight);
+    psmi_assert(cntr_init == proto->iovec_cntr_next_inflight);
 
     if (nsent > 0) {
 	uint64_t t_cyc = get_cycles();
@@ -1532,7 +1517,7 @@ ips_dma_transfer_frame(struct ips_proto *proto, struct ips_flow *flow,
     psm_error_t err;
     uint32_t have_cksum = 
       ((proto->flags & IPS_PROTO_FLAG_CKSUM) &&
-       (((__le32_to_cpu(pbc_hdr_i->hdr.iph.ver_context_tid_offset) >> INFINIPATH_I_TID_SHIFT) & INFINIPATH_I_TID_MASK) == IPATH_EAGER_TID_ID) && (pbc_hdr_i->hdr.mqhdr != MQ_MSG_DATA_BLK) && (pbc_hdr_i->hdr.mqhdr != MQ_MSG_DATA_REQ_BLK));
+       (((__le32_to_cpu(pbc_hdr_i->hdr.iph.ver_context_tid_offset) >> INFINIPATH_I_TID_SHIFT) & INFINIPATH_I_TID_MASK) == IPATH_EAGER_TID_ID) && (pbc_hdr_i->hdr.mqhdr != MQ_MSG_DATA_BLK));
     
     psmi_assert((paylen & 0x3) == 0);		 /* require 4-byte multiple */
     psmi_assert(((uintptr_t) payload & 0x3) == 0); /* require 4-byte alignment */
@@ -1562,8 +1547,8 @@ ips_dma_transfer_frame(struct ips_proto *proto, struct ips_flow *flow,
 	    goto fail;
 	}
 	
-	psmi_mq_mtucpy(pbc_hdr, pbc_hdr_i, sizeof(struct ips_pbc_header));
-	psmi_mq_mtucpy(pbc_hdr+1, payload, paylen);
+	memcpy(pbc_hdr, pbc_hdr_i, sizeof(struct ips_pbc_header));
+	memcpy(pbc_hdr+1, payload, paylen);
 	
 	if (have_cksum) {
 	  uint32_t *ckptr = (uint32_t*) ((uint8_t*) pbc_hdr + 
@@ -1575,7 +1560,7 @@ ips_dma_transfer_frame(struct ips_proto *proto, struct ips_flow *flow,
 	
 	iovec.iov_base = pbc_hdr;
 	iovec.iov_len  = len;
-	ret = ipath_cmd_writev(proto->fd, &iovec, 1);
+	ret = writev(proto->fd, &iovec, 1);
     }
     else {
         uint32_t len = sizeof(struct ips_pbc_header) + 
@@ -1590,7 +1575,7 @@ ips_dma_transfer_frame(struct ips_proto *proto, struct ips_flow *flow,
 	
 	if (have_cksum) {
 	  uint32_t *ckptr = (uint32_t*) (pbc_hdr + 1);
-	  psmi_mq_mtucpy(pbc_hdr, pbc_hdr_i, sizeof(struct ips_pbc_header));
+	  memcpy(pbc_hdr, pbc_hdr_i, sizeof(struct ips_pbc_header));
 	  *ckptr = cksum;
 	  ckptr++;
 	  *ckptr = cksum;
@@ -1598,7 +1583,7 @@ ips_dma_transfer_frame(struct ips_proto *proto, struct ips_flow *flow,
 	
 	iovec.iov_base = pbc_hdr;
 	iovec.iov_len  = len;
-	ret = ipath_cmd_writev(proto->fd, &iovec, 1);
+	ret = writev(proto->fd, &iovec, 1);
     }
 
     if (ret > 0) {
@@ -1689,8 +1674,7 @@ writev_again:
 	/* Checksum all eager packets */
 	cksum = ((proto->flags & IPS_PROTO_FLAG_CKSUM) && 
 		 (scb->tid == IPATH_EAGER_TID_ID) &&
-		 (scb->ips_lrh.mqhdr != MQ_MSG_DATA_BLK) &&
-		 (scb->ips_lrh.mqhdr != MQ_MSG_DATA_REQ_BLK));
+		 (scb->ips_lrh.mqhdr != MQ_MSG_DATA_BLK));
 	
 	ips_proto_pbc_update(proto, flow, PSMI_FALSE, &scb->pbc, 
 			     sizeof(struct ips_message_header),
@@ -1735,7 +1719,7 @@ writev_again:
 		  }
 		  
 		  /* Only need to copy if bounce buffer is used. */
-		  psmi_mq_mtucpy(scb->payload, buf, len);
+		  memcpy(scb->payload, buf, len);
 		  scb->payload_size = len;
 		}
 		
@@ -1785,7 +1769,7 @@ writev_again:
 	    uint32_t *ckptr = (uint32_t*) 
 	      ((uint8_t*) pbc_hdr + iovec[vec_idx-1].iov_len);
 	    
-	    psmi_mq_mtucpy(pbc_hdr, iovec[vec_idx-1].iov_base,iovec[vec_idx-1].iov_len);
+	    memcpy(pbc_hdr, iovec[vec_idx-1].iov_base,iovec[vec_idx-1].iov_len);
 	    *ckptr = scb->cksum;
 	    ckptr++;
 	    *ckptr = scb->cksum;
@@ -1804,7 +1788,7 @@ writev_again:
 	    break;
     }
     psmi_assert(vec_idx > 0);
-    ret = ipath_cmd_writev(proto->fd, iovec, vec_idx);
+    ret = writev(proto->fd, iovec, vec_idx);
     
     /* 
      * Successfully wrote entire vector 
@@ -2006,7 +1990,7 @@ ips_proto_timer_send_callback(struct psmi_timer *current_timer, uint64_t current
 		proto->cace[flow->path->epr_sl].ccti_increase);
     }
 
-    flow->fn.xfer.flush(flow, NULL);    
+    (void)flow->fn.xfer.flush(flow, NULL);
     return PSM_OK;
 }
 

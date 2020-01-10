@@ -1,5 +1,4 @@
 /*
- * Copyright (c) 2013. Intel Corporation. All rights reserved.
  * Copyright (c) 2006-2012. QLogic Corporation. All rights reserved.
  * Copyright (c) 2003-2006, PathScale, Inc. All rights reserved.
  *
@@ -552,7 +551,7 @@ psm_mq_test(psm_mq_req_t *request, psm_mq_status_t *status);
  *
  * [retval] PSM_OK The request could be successfully cancelled such that the
  *                preposted receive buffer could be removed from the preposted
- *                receive queue before a match occurred. The associated @c
+ *                receive queue before a match occured. The associated @c
  *                request remains unchanged and the user must still return
  *                the storage to the MQ library.
  *

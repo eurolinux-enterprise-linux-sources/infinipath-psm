@@ -30,6 +30,7 @@
 # SOFTWARE.
 #
 
+top_srcdir := ..
 include $(top_srcdir)/buildflags.mak
 CFLAGS += -DPSM_UUID=1 -Wno-unused-function
 INCLUDES += -I$(top_srcdir) -I$(top_srcidr)/libuuid

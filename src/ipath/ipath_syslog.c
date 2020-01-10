@@ -50,12 +50,13 @@ ipath_vsyslog(const char *prefix, int to_console, int level,
 	     const char *format, va_list ap)
 {
     char logprefix[SYSLOG_MAXLEN];
+    size_t len;
 
     if (to_console) {
 	char hostname[80];
 	va_list ap_cons;
 	va_copy(ap_cons, ap);
-	size_t len = strlen(format);
+	len = strlen(format);
 	gethostname(hostname, sizeof hostname);
 	hostname[sizeof hostname - 1] = '\0';
 
@@ -68,10 +69,9 @@ ipath_vsyslog(const char *prefix, int to_console, int level,
 	if (format[len] != '\n')
 	    fprintf(stderr, "\n");
 	fflush(stderr);
-	va_end(ap_cons);
     }
 
-    (void)snprintf(logprefix, sizeof(logprefix), 
+    len = snprintf(logprefix, sizeof(logprefix), 
 	  "(ipath/%s)[%d]: %s", prefix ? prefix : "ipath", (int) getpid(),
 	  format);
 

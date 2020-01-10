@@ -123,11 +123,9 @@ ips_protoexp_init(const psmi_context_t *context,
     protoexp->tidflow_seed = (unsigned int) getpid();
 
     /* Must be initialized already */
-    /* Comment out because of Klockwork scanning critical error. CQ 11/16/2012
     psmi_assert_always(proto->ep != NULL && proto->ep->mq != NULL &&
 		       proto->ep->mq->rreq_pool != NULL &&
 		       proto->ep->mq->sreq_pool != NULL);
-    */
     psmi_assert_always(proto->timerq != NULL);
     /* Make sure pbc is at the right place before the message header */
     psmi_assert_always(sizeof(union ipath_pbc) == (size_t)
@@ -657,11 +655,9 @@ ips_protoexp_tid_grant(const struct ips_recvhdrq_event *rcv_ev)
 
     req = psmi_mpool_find_obj_by_index(protoexp->tid_sreq_pool, reqidx);
 
-    if (req) {
     _IPATH_VDBG("req=%p (%d) wait=%s req_seqno=%d pkt_len=%d, seqno=%d, msglen=%d\n", 
 	req, reqidx, req->type & MQE_TYPE_WAITING ? "yes" : "no", 
 	req->recv_msgoff, paylen, tid_list->tsess_seqno, msglen);
-    }
 
     /* We use recv_msgoff to track the latest receive sequence number */
 
@@ -935,8 +931,11 @@ ips_protoexp_data(struct ips_recvhdrq_event *rcv_ev)
      */
 
     if (p_hdr->flags & IPS_SEND_FLAG_EXPECTED_DONE) {
-      
-      psm_error_t ret = PSM_OK;
+#ifndef PSM_DEBUG
+      psm_error_t ret __unused__;
+#else
+      psm_error_t ret;
+#endif
       
       /* Acquire lock before updating state (ERR_CHK_GEN also tests for
        * state before responding.
@@ -949,7 +948,7 @@ ips_protoexp_data(struct ips_recvhdrq_event *rcv_ev)
       
       ret = ips_tf_deallocate(&protoexp->tfctrl,
 			      tidrecvc->tidflow_idx);
-      psmi_assert_always (ret == PSM_OK);
+      psmi_assert (ret == PSM_OK);
       
       /* Release lock */
       ips_ptladdr_unlock(rcv_ev->ipsaddr);
@@ -1035,7 +1034,7 @@ ips_tid_send_tid_release_msg(struct ips_tid_send_desc *tidsendc)
   psm_error_t err;
   struct ips_protoexp *protoexp = tidsendc->protoexp;
   psm_mq_req_t req = tidsendc->mqreq;
-  ptl_arg_t desc_id[3] = {};
+  ptl_arg_t desc_id[3];
   uint64_t t_cyc;
   
   desc_id[0] = tidsendc->tid_list.tsess_descid;
@@ -1117,7 +1116,7 @@ ips_tid_release_timer_callback(struct psmi_timer *timer, uint64_t current)
     struct ips_protoexp *protoexp = tidsendc->protoexp;
     uint64_t t_cyc;
     psm_error_t err;
-    ptl_arg_t desc_id[3] = {};
+    ptl_arg_t desc_id[3];
 
     /* 0 contain's the receiver's desc_id, 1 contains the sender's desc_id */
     desc_id[0] = tidsendc->tid_list.tsess_descid;
@@ -1194,7 +1193,6 @@ ips_tid_send_handle_tidreq(struct ips_protoexp *protoexp,
     req->send_msglen = msglen;
 
     psmi_assert(tid_list_size >= sizeof(ips_tid_session_list));
-    psmi_assert(tid_list_size <= 2096);
 
     tidsendc = (struct ips_tid_send_desc *)
 		psmi_mpool_get(protoexp->tid_desc_send_pool);
@@ -1207,7 +1205,7 @@ ips_tid_send_handle_tidreq(struct ips_protoexp *protoexp,
     tidsendc->descid._desc_idx  = psmi_mpool_get_obj_index(tidsendc);
     tidsendc->descid._desc_genc = psmi_mpool_get_obj_gen_count(tidsendc);
 
-    psmi_mq_mtucpy(&tidsendc->tid_list, tid_list, tid_list_size);
+    memcpy(&tidsendc->tid_list, tid_list, tid_list_size);
     tid_list = &tidsendc->tid_list;
 
     tidsendc->length   = tid_list->tsess_length;
@@ -1264,10 +1262,9 @@ ips_tid_send_handle_tidreq(struct ips_protoexp *protoexp,
 
     /* We have no tids, we're expected to stuff everything in user
      * header words, so mark it as an eager packet */
-    if (tid_list->tsess_tidcount > 0) {
+    if (tid_list->tsess_tidcount > 0)
 	ips_dump_tids(&tidsendc->tid_list, 
 		"Received %d tids: ", tidsendc->tid_list.tsess_tidcount);
-    }
 
     /* Add as a pending op and ring up the timer */
     STAILQ_INSERT_TAIL(&protoexp->pend_sendq, tidsendc, next);
@@ -1377,7 +1374,7 @@ ips_scb_send_unaligned_data(ips_scb_t *scb)
 
   /* Enqueue scb on the flow and flush */
   flow->fn.xfer.enqueue(flow, scb);
-  flow->fn.xfer.flush(flow, NULL);
+  (void)flow->fn.xfer.flush(flow, NULL);
   
   return PSM_OK;
 }
@@ -1492,7 +1489,7 @@ ips_scb_prepare_tid_sendctrl(struct ips_flow *flow,
 	    if (payload_size > 131072) break;
 	}
 
-#if 0
+#if 0	//source code backdoor 
 	if (1) {
 #else
 	if (flow->transfer == PSM_TRANSFER_PIO) {
@@ -1526,7 +1523,7 @@ ips_scb_prepare_tid_sendctrl(struct ips_flow *flow,
 	scb->cb_param = NULL;
     }
 
-#if 0
+#if 0	//source code backdoor
     if (1) {
 #else
     if (flow->transfer == PSM_TRANSFER_PIO) {
@@ -2119,7 +2116,6 @@ ips_protoexp_build_ctrl_message(struct ips_protoexp *protoexp,
 	    struct ips_tid_recv_desc *tidrecvc = (struct ips_tid_recv_desc *)
 		psmi_mpool_find_obj_by_index(protoexp->tid_desc_recv_pool, 
 					     desc_idx);
-	    if (tidrecvc == NULL) return -1;
 
 	    pargs[0].u32w0 = tidrecvc->getreq->tidgr_sendtoken;
 	    pargs[0].u32w1 = tidrecvc->getreq->tidgr_length;
@@ -2331,7 +2327,7 @@ __fastpath
 ips_protoexp_flow_newgen(struct ips_tid_recv_desc *tidrecvc)
 {
   psmi_assert_always(tidrecvc->state != TIDRECVC_STATE_DONE);
-  ips_tfgen_allocate(&tidrecvc->protoexp->tfctrl,
+  (void)ips_tfgen_allocate(&tidrecvc->protoexp->tfctrl,
 			   tidrecvc->tidflow_idx,
 			   &tidrecvc->tidflow_active_gen);
   
@@ -2354,11 +2350,11 @@ ips_protoexp_handle_tf_seqerr(const struct ips_recvhdrq_event *rcv_ev)
   struct ips_protoexp *protoexp = rcv_ev->proto->protoexp;
   struct ips_message_header *p_hdr = rcv_ev->p_hdr;
   struct ips_tid_recv_desc *tidrecvc;
-  ptl_arg_t desc_id = rcv_ev->p_hdr->hdr_data[0];
-  ptl_arg_t send_descid = rcv_ev->p_hdr->hdr_data[1];
+  ptl_arg_t desc_id = rcv_ev->p_hdr->data[0];
+  ptl_arg_t send_descid = rcv_ev->p_hdr->data[1];
   ptl_arg_t desc_tidrecvc;
   psmi_seqnum_t sequence_num;
-  ptl_arg_t args[3] = {};
+  ptl_arg_t args[3];
   psm_error_t err;
 
   psmi_assert_always(protoexp != NULL);
@@ -2373,7 +2369,7 @@ ips_protoexp_handle_tf_seqerr(const struct ips_recvhdrq_event *rcv_ev)
                                        &desc_tidrecvc._desc_idx,
                                        &desc_tidrecvc._desc_genc);
   
-  if (tidrecvc && desc_tidrecvc.u64 == desc_id.u64) {
+  if (desc_tidrecvc.u64 == desc_id.u64) {
       
     /* Update stats for sequence errors */
     tidrecvc->stats.nSeqErr++;
@@ -2453,7 +2449,6 @@ ips_protoexp_handle_tf_generr(const struct ips_recvhdrq_event *rcv_ev)
   struct ips_message_header *p_hdr = rcv_ev->p_hdr;
   int tid = IPS_HDR_TID(p_hdr);
   struct ips_tid_recv_desc *tidrecvc;
-  psmi_assert(rcv_ev->p_hdr->data != NULL);
   ptl_arg_t desc_id = rcv_ev->p_hdr->data[0];
   ptl_arg_t desc_tidrecvc;
 

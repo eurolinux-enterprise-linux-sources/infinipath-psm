@@ -49,16 +49,15 @@ void *psmi_memcpyo(void *dst, const void *src, size_t n)
     return dst;
 }
 #else
-#error "psmi_memcpyo() does not use psmi_mq_mtucpy()"
 #include <emmintrin.h>
 
 #define OPTERON_L1_CACHE_BYTES 65536
 #define OPTERON_L2_CACHE_BYTES 1048576
 
-static inline size_t __memcpy_pathscale_opteron_sse2
+static size_t __memcpy_pathscale_opteron_sse2
   (uint8_t *d, const uint8_t *s, size_t n) __attribute__ ((always_inline));
 
-static inline size_t __memcpy_pathscale_opteron_sse2
+static size_t __memcpy_pathscale_opteron_sse2
   (uint8_t *d, const uint8_t *s, size_t n)
 {
   assert(n >= 16);

@@ -30,15 +30,16 @@
 # SOFTWARE.
 #
 
+top_srcdir := ..
 include $(top_srcdir)/buildflags.mak
 INCLUDES += -I$(top_srcdir)
 
-${TARGLIB}-objs := am_reqrep.o am_reqrep_shmem.o ptl.o kcopyrwu.o knemrwu.o scifrwu.o
+${TARGLIB}-objs := am_reqrep_shmem.o ptl.o kcopyrwu.o knemrwu.o
 
 all: ${${TARGLIB}-objs}
 
 %.o: %.c
-	$(CC) $(CFLAGS) $(INCLUDES) $(if $(PSM_HAVE_SCIF:0=),$(SCIF_INCLUDE_FLAGS)) -c $< -o $@
+	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
 
 clean:
 	rm -f *.o

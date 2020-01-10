@@ -42,11 +42,7 @@
 #ifdef __inline__
 #undef __inline__
 #endif
-#define __inline__ inline __attribute__((always_inline,unused))
-#ifdef __unused__
-#undef __unused__
-#endif
-#define __unused__ __attribute__((unused))
+#define __inline__ __attribute__((always_inline,unused))
 
 #include "sysdep.h"
 #include "bit_ops.h"
@@ -65,6 +61,7 @@ typedef struct _atomic {
   #define if_pf(cond) if (cond)
   #define _Pragma_unlikely _Pragma("mips_frequency_hint never")
   #define _Pragma_likely   _Pragma("mips_frequency_hint frequent")
+  #define __unused__
 #elif defined(__GNUC__) || (defined(__PATHCC__) && __PATHCC__ >= 3)
   #define likely(x)    __builtin_expect(!!(x), 1L)
   #define unlikely(x)  __builtin_expect(!!(x), 0L)
@@ -72,6 +69,7 @@ typedef struct _atomic {
   #define if_pf(cond) if (unlikely(cond))
   #define _Pragma_unlikely
   #define _Pragma_likely
+  #define __unused__ __attribute__((unused))
 #else
   #error "Unsupported compiler"
 #endif

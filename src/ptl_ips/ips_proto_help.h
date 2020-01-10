@@ -40,7 +40,6 @@
 #include "ipserror.h"
 #include "psm_mq_internal.h" // psmi_mq_handle_tiny_envelope
 #include "ptl_ips.h"
-#include "ips_epstate.h"
 
 /* Some tunable compile-time options */
 #define IPS_TINY_PROCESS_MQTINY 1   /* whether mq processing of tiny pkts is
@@ -79,8 +78,12 @@ ips_flow_gen_ackflags(ips_scb_t *scb, struct ips_flow *flow))
 PSMI_ALWAYS_INLINE(
 ptl_epaddr_flow_t ips_proto_flowid(struct ips_message_header *p_hdr))
 {
-  ptl_epaddr_flow_t flowidx = IPS_FLOWID2INDEX(p_hdr->flowid);
+  psm_protocol_type_t protocol __unused__;
+  ptl_epaddr_flow_t flowidx;
+  
+  IPS_FLOWID_UNPACK(p_hdr->flowid, protocol, flowidx);
   psmi_assert(flowidx < EP_FLOW_LAST);
+  
   return flowidx;
 }
 
@@ -107,7 +110,7 @@ int ips_do_cksum(struct ips_proto *proto,
 {
 
   if_pf ((proto->flags & IPS_PROTO_FLAG_CKSUM) && 
-      (((__le32_to_cpu(p_hdr->iph.ver_context_tid_offset) >> INFINIPATH_I_TID_SHIFT) & INFINIPATH_I_TID_MASK) == IPATH_EAGER_TID_ID) && (p_hdr->mqhdr != MQ_MSG_DATA_BLK) && (p_hdr->mqhdr != MQ_MSG_DATA_REQ_BLK)) {
+      (((__le32_to_cpu(p_hdr->iph.ver_context_tid_offset) >> INFINIPATH_I_TID_SHIFT) & INFINIPATH_I_TID_MASK) == IPATH_EAGER_TID_ID) && (p_hdr->mqhdr != MQ_MSG_DATA_BLK)) {
     
     uint16_t paywords;
         
@@ -244,10 +247,14 @@ PSMI_ALWAYS_INLINE(
 uint32_t ips_proto_dest_context_from_header(struct ips_proto *proto,
 					    struct ips_message_header *p_hdr))
 {
+  uint64_t lid __unused__;
+  uint64_t context __unused__;
+  uint64_t subcontext __unused__;
   uint16_t hca_type;
+  uint16_t sl __unused__;
   uint32_t dest_context;
   
-  hca_type = PSMI_EPID_GET_HCATYPE(proto->ep->epid);
+  PSMI_EPID_UNPACK_EXT(proto->ep->epid, lid, context, subcontext, hca_type, sl);
   
   dest_context = 
     (__le32_to_cpu(p_hdr->iph.ver_context_tid_offset) >> INFINIPATH_I_CONTEXT_SHIFT) & INFINIPATH_I_CONTEXT_MASK;
@@ -384,7 +391,7 @@ ips_scb_prepare_flow_inner(ips_scb_t *scb,
 {
     uint32_t extra_bytes;
     uint32_t tot_paywords;
-    uint16_t pkt_flags = IPS_EPSTATE_COMMIDX_PACK(epr->epr_commidx_to);
+    uint16_t pkt_flags = 0;
     
     extra_bytes = scb->payload_size & 3;
     if (extra_bytes) {
@@ -484,7 +491,7 @@ ips_proto_send_ack(struct ips_recvhdrq *recvq, struct ips_flow *flow))
   }
   else {
     /* Coalesced ACKs disabled. Send ACK immediately */
-    ips_proto_send_ctrl_message(flow, OPCODE_ACK, 
+    ips_proto_send_ctrl_message(flow, OPCODE_ACK,
 				&flow->ipsaddr->ctrl_msg_queued, NULL);
   }
 }
